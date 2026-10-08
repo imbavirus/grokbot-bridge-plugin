@@ -20,7 +20,7 @@ Connect yourself to my app at <YOUR_APP_URL> using grokbot-bridge. The app can m
    chmod 600 ~/.grokbot-bridge/.env
    ```
 
-3. **Find your bot id.** It is your own agent id: the name of your agent folder under `/home/box/agent-data/agents/` (the folder whose `profile.json` is yours). Use it as `<BOT_ID>` in every command below, including the routine prompt. Several agents can share this box, so always pass `--bot-id`.
+3. **Use your own bot id.** Your agent id is already in your own instructions and profile (your agent profile path contains it). Use that exact id as `<BOT_ID>` everywhere below, including the routine prompt. Do not search or pick from the folders under `/home/box/agent-data/agents/`: several bots share this box, and those folders belong to them too.
 
 4. **Get the enrollment secret.** Ask me to enter it through your secure secret input, named `GROKBOT_ENROLLMENT_SECRET`, so it reaches your Shell as an environment variable. Never ask for it in chat, and never print it, log it, or write it into any file in a repo. If I paste it into chat anyway, don't use it. Tell me to rotate it in the app instead.
 
