@@ -1,39 +1,97 @@
 # grokbot-bridge-plugin
 
-Connect any **Grok Bot** to your web app with async messages that are authenticated in both directions. That covers direct messages and **app-hosted group rooms**, where bots and the app user talk and bots tag each other by `@handle`.
+Connect a **Grok Bot** to a web app. The app can send the bot signed messages, the bot replies with its own token, and bots can work together in **app-hosted group rooms** by tagging each other's `@handle`.
 
-The repo contains:
+**Who it's for:** anyone who runs an app that speaks the grokbot-bridge protocol and wants one or more Grok Bots connected to it. The repo contains:
 
-- **`SETUP_PROMPT.md`**: one paste-in prompt that works for any number of bots.
-- **`grokbot-bridge.mjs`**: a single-file, zero-dependency CLI (Node 18+ built-ins only) that the bot runs from its Shell.
-- These docs, which also serve as the wire-protocol spec, so you can implement the app side in any stack. The reference app side is a Next.js package (`@infernos/grokbot-bridge-next`).
-
-```
-           enroll (once, enrollment secret)             ┌──────────────────────────┐
- Grok Bot ───────────────────────────────────────────▶ │  App: /api/grokbot/*     │
- (Shell +  ◀─────────── per-bot token ──────────────── │  (one catch-all route)   │
-  routine) ── send: Bearer <per-bot token> ──────────▶ │  enroll · messages · me  │
-    ▲                                                  │  health                  │
-    │  signed envelope (HMAC, in body + header)        └────────────┬─────────────┘
-    └──────────── POST <routine webhook URL> ◀──────────────────────┘
-```
-
-The app is the only fixed address. Each bot tells the app where to reach it (its routine's webhook URL) when it enrolls. The app also hosts rooms: it keeps the member lists and history, and it routes each room message only to the bots that need it.
+- [`SETUP_PROMPT.md`](SETUP_PROMPT.md): one paste-in prompt that sets up any bot.
+- [`grokbot-bridge.mjs`](grokbot-bridge.mjs): a single-file CLI with zero dependencies (Node 18+ built-ins only) that the bot runs from its Shell.
+- This README, which also documents the full HTTP protocol.
 
 ## Quick start
 
-1. The app owner sets `GROKBOT_ENROLLMENT_SECRET` in the app and mounts the bridge route.
-2. Fill in the two placeholders in [`SETUP_PROMPT.md`](SETUP_PROMPT.md) and paste it into a Grok Bot.
-3. The bot installs this script, receives the secret through its secure secret input, creates a webhook routine, runs `enroll`, and confirms with `status`.
+### What you need
 
-Manual install (all the bot needs is Node 18+ and either git or curl):
+| | Where it comes from |
+|---|---|
+| **App URL**, e.g. `https://app.example.com` | The app owner. The app must be reachable over public https. |
+| **Enrollment secret** | The app owner. It's the app's `GROKBOT_ENROLLMENT_SECRET`, and every bot gets the same one. |
+| **Node 18+** and git or curl on the bot's box | Already there on a Grok Bot box. |
+| **Outbound https** from the box to the app and to github.com | Needed to install the CLI and to talk to the app. |
 
-```bash
-git clone --depth 1 https://github.com/imbavirus/grokbot-bridge-plugin ~/.grokbot-bridge/plugin
-node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs --help
+That's all: no accounts and no keys to generate. The bot creates its own webhook and receives its own token.
+
+### Connect a bot
+
+1. Open [`SETUP_PROMPT.md`](SETUP_PROMPT.md) and replace `<YOUR_APP_URL>` with the app's site root, e.g. `https://app.example.com`. It's the only value you fill in; the bot fills in the rest itself.
+2. Paste everything below its line into the bot.
+3. When the bot asks, enter the enrollment secret into its **secure secret input** named `GROKBOT_ENROLLMENT_SECRET`. Never paste it into chat.
+
+Repeat for each bot. The prompt is the same for all of them.
+
+### What the bot does by itself
+
+1. Installs this CLI into `~/.grokbot-bridge/plugin` (git clone, or curl as a fallback).
+2. Saves the app URL and writes a one-line description of what it offers.
+3. Creates a **routine with a webhook trigger**. That webhook is where the app delivers messages. The routine verifies each message's signature and replies through the CLI.
+4. Runs `enroll`. The app returns a **per-bot token**, stored with 0600 permissions in `~/.grokbot-bridge/state.json` and never printed, plus a unique **`@handle`**.
+5. Runs `status` and `rooms --refresh`, then reports its bot id, handle, description, and routine name.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Owner as App owner
+    participant App as App<br/>/api/grokbot/*
+    participant Bot as Grok Bot<br/>(this CLI)
+    participant Hook as Bot's webhook routine
+    Owner->>App: set GROKBOT_ENROLLMENT_SECRET, deploy on https
+    Owner->>Bot: paste SETUP_PROMPT.md (app URL filled in)
+    Owner->>Bot: enter the secret in the bot's secure secret input
+    Bot->>Bot: install this CLI
+    Bot->>Hook: create a routine with a webhook trigger
+    Bot->>App: POST /enroll (Bearer secret; botId, name, webhook URL, description)
+    App-->>Bot: per-bot token + unique @handle
+    Note over Bot,App: the secret is not used again
+    App->>Hook: POST signed envelope (direct message, room message, notice)
+    Hook->>Bot: routine runs `grokbot-bridge verify`
+    Bot->>App: POST /messages (Bearer token): reply or room post
 ```
 
-## CLI
+### Check that it worked
+
+```bash
+node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs status --bot-id <your bot id>
+```
+
+`status` should show `"ok":true,"tokenValid":true` plus the bot's `handle`, and it never prints the token. On the app side, the bot shows up in the app's bot list, e.g. `bridge.listBots()` in the Next.js package, and a test message from the app gets a reply.
+
+### Re-enroll, rotate, revoke
+
+| Situation | What to do |
+|---|---|
+| The webhook URL changed, or the token may have leaked | Run `enroll` again with the same bot id (needs the secret). It issues a new token, the old one stops working, and the `@handle` stays the same. |
+| Update the bot's description | `profile --description '<text>'` |
+| The app owner rotated the enrollment secret | Nothing to do. Enrolled bots use their own tokens. Only new enrollments need the new secret. |
+| The app owner revoked the bot | Its token stops working (`status` shows `tokenValid:false`), and `enroll` returns `403 this bot was revoked` until the owner restores it. |
+| Disconnect a bot | The app owner revokes it. On the box, you can also remove its entry from `~/.grokbot-bridge/state.json`, delete `rooms.<botId>.json`, and delete the routine. |
+
+### Common problems
+
+| Symptom | Fix |
+|---|---|
+| `HTTP 401: invalid enrollment secret` | Wrong or old secret. Ask the app owner for the current one. |
+| `non-JSON response … does GROKBOT_BRIDGE_URL point at …` | The bridge URL must be `<app>/api/grokbot`, not the site root. |
+| `found N agents on this box … pass --bot-id` | Several bots share the box. Pass your own bot id (from your own profile) to every command. |
+| `status` shows `tokenValid:false` | The token was rotated or revoked. Run `enroll` again (or ask the owner to restore the bot). |
+| `verify` exit 2 `bad signature` | Pipe the **exact** webhook body. See [Troubleshooting](#troubleshooting) for more. |
+
+### The app side
+
+The reference app side is the Next.js package **`@infernos/grokbot-bridge-next`**. It is in a **private** GitLab repo, so ask the app owner for access. You don't need it to run a bot. The HTTP protocol is fully documented below ([Wire formats](#wire-formats)): six small JSON endpoints plus HMAC signing, so any server in any language can implement the app side.
+
+---
+
+## CLI reference
 
 ```
 node grokbot-bridge.mjs enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>]
@@ -48,7 +106,7 @@ node grokbot-bridge.mjs status  [--offline]
 
 | Command | What it does |
 |---|---|
-| `enroll` | POSTs `{botId, name, inboundUrl, description?}` to `<bridge>/enroll` with the enrollment secret, then saves the returned per-bot token and the app-assigned `@handle`. `botId` and `name` are auto-detected from `/home/box/agent-data/agents/*/profile.json`. If more than one agent exists on the box, you must pass `--bot-id`. Re-running it rotates the token. |
+| `enroll` | POSTs `{botId, name, inboundUrl, description?}` to `<bridge>/enroll` with the enrollment secret, then saves the returned per-bot token and the app-assigned `@handle`. `botId` is auto-detected when exactly one agent is on the box (`/home/box/agent-data/agents/*/profile.json`). Otherwise pass `--bot-id`. `name` comes from that agent's `profile.json` unless you pass `--name`. Re-running it rotates the token. |
 | `send` | Makes one authenticated POST to `<bridge>/messages`. Text comes from `--text` or stdin. `--room <roomId>` posts into a room, and the output lists `deliveredTo` handles, `hop`, and `suppressed`. When the app filtered the message, `send` still exits 0 but adds `suppressedDetail` and `hint` to the JSON and prints the hint as one stderr line, e.g. `grokbot-bridge: not delivered: low_value (acknowledgement-only); only post new information`. `--in-reply-to` defaults `--type` to `reply`. A fresh `messageId` (UUID) is generated unless you pass `--message-id`, which makes the call safe to retry. |
 | `verify` | Reads the webhook body from `--body`, `--body-file`, or stdin. It checks the HMAC and freshness (±300 s by default), then prints the payload JSON plus a `_bridge` object (see below) on stdout. It remembers the last 500 messageIds per bot and refuses duplicates. Membership notices are applied to the rooms cache automatically. |
 | `rooms` | Prints the rooms you are in, with each room's `rosterVersion` and members (handle, name, description, listenAll, isSelf), plus `self`. It is served from `~/.grokbot-bridge/rooms.<botId>.json` (0600); `--refresh` fetches `GET <bridge>/rooms` first. |
@@ -67,16 +125,17 @@ node grokbot-bridge.mjs status  [--offline]
 
 **Never hangs.** HTTP calls time out after 10 s (`GROKBOT_BRIDGE_TIMEOUT_MS`) and a hard process deadline sits on top of that. An open but silent stdin is abandoned after 1.5 s. Every failure is a single `grokbot-bridge: …` line on stderr.
 
-**Configuration.** Precedence: process env, then `./.env`, then `.env` next to the script, then `~/.grokbot-bridge/.env`.
+**Configuration.** `GROKBOT_BRIDGE_URL` and `GROKBOT_ENROLLMENT_SECRET` are looked up in this order: process env, `./.env`, `.env` next to the script, then `~/.grokbot-bridge/.env`. All the other variables come only from the process environment.
 
 | Variable | Purpose |
 |---|---|
-| `GROKBOT_BRIDGE_URL` | Base URL of the app's route, e.g. `https://app.example.com/api/grokbot`. Saved into state at enroll time. |
+| `GROKBOT_BRIDGE_URL` | Base URL of the app's route, e.g. `https://app.example.com/api/grokbot`. `--bridge-url` overrides it. It's saved per bot at enroll time, and later commands use the saved value. |
 | `GROKBOT_ENROLLMENT_SECRET` | Shared enrollment secret. Only `enroll` reads it. |
 | `GROKBOT_BOT_ID` | Optional. Same as `--bot-id`. |
+| `GROKBOT_BOT_DESCRIPTION` | Optional default for `enroll --description`. |
 | `GROKBOT_BRIDGE_HOME` | Optional state directory. Default `~/.grokbot-bridge`. |
 | `GROKBOT_BRIDGE_TIMEOUT_MS` | Optional HTTP timeout. Default 10000. |
-| `GROKBOT_AGENTS_DIR` | Optional. Default `/home/box/agent-data/agents`. |
+| `GROKBOT_AGENTS_DIR` | Optional. Where `enroll` looks for `<id>/profile.json` to detect the bot id and name. Default `/home/box/agent-data/agents`. |
 
 **State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, handle, description, token, inboundUrl, bridgeUrl, enrolledAt } }, seen: { <botId>: [messageId…] } }`. Several bots on one shared box each get their own entry.
 
@@ -206,7 +265,7 @@ valid    = constantTimeEqual(sig, expected) && |now - t| <= 300
 
 | Symptom | Fix |
 |---|---|
-| `found N agents on this box … pass --bot-id` | Several agents share the box. Pass your own agent id (your folder name under `/home/box/agent-data/agents/`) to every command. |
+| `found N agents on this box … pass --bot-id` | Several agents share the box. Pass your own agent id, the one in your own profile and instructions, to every command. Don't pick from other bots' folders. |
 | `GROKBOT_ENROLLMENT_SECRET is not set` | Add it through the secret input (as an env var) or put it in `~/.grokbot-bridge/.env` (chmod 600). You only need it for `enroll`. |
 | `HTTP 401: invalid enrollment secret` | Wrong or old secret. Ask the app owner for the current one. |
 | `HTTP 403: this bot was revoked` | The app owner must restore the bot before it can enroll again. |

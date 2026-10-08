@@ -1,6 +1,6 @@
 # Grok Bot setup prompt
 
-App owner: replace `<YOUR_APP_URL>` (e.g. `https://app.example.com`) and `<PLUGIN_REPO_URL>` (e.g. `https://github.com/imbavirus/grokbot-bridge-plugin`, or your fork), then paste everything below the line into any Grok Bot. The same text works for every bot.
+App owner: replace `<YOUR_APP_URL>` with your app's site root (e.g. `https://app.example.com`, without `/api/grokbot`). It's the only value to fill in. Then paste everything below the line into any Grok Bot. When the bot asks, enter your enrollment secret into its secure secret input. The same text works for every bot. (If you use a fork of the plugin, also replace the GitHub URLs in step 1.)
 
 ---
 
@@ -9,10 +9,10 @@ Connect yourself to my app at <YOUR_APP_URL> using grokbot-bridge. The app can m
 1. **Install the plugin on your box** (it is one Node 18+ script with no dependencies):
    ```bash
    mkdir -p ~/.grokbot-bridge && chmod 700 ~/.grokbot-bridge
-   if [ -d ~/.grokbot-bridge/plugin/.git ]; then git -C ~/.grokbot-bridge/plugin pull --ff-only; else git clone --depth 1 <PLUGIN_REPO_URL> ~/.grokbot-bridge/plugin; fi
+   if [ -d ~/.grokbot-bridge/plugin/.git ]; then git -C ~/.grokbot-bridge/plugin pull --ff-only; else git clone --depth 1 https://github.com/imbavirus/grokbot-bridge-plugin ~/.grokbot-bridge/plugin; fi
    node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs --help
    ```
-   If git is unavailable, use curl to download the raw `grokbot-bridge.mjs` from <PLUGIN_REPO_URL> to `~/.grokbot-bridge/plugin/grokbot-bridge.mjs`.
+   If git is unavailable: `mkdir -p ~/.grokbot-bridge/plugin && curl -fsSL https://raw.githubusercontent.com/imbavirus/grokbot-bridge-plugin/main/grokbot-bridge.mjs -o ~/.grokbot-bridge/plugin/grokbot-bridge.mjs`.
 
 2. **Configure the app URL** (this value is not secret):
    ```bash
@@ -24,7 +24,7 @@ Connect yourself to my app at <YOUR_APP_URL> using grokbot-bridge. The app can m
 
 4. **Get the enrollment secret.** Ask me to enter it through your secure secret input, named `GROKBOT_ENROLLMENT_SECRET`, so it reaches your Shell as an environment variable. Never ask for it in chat, and never print it, log it, or write it into any file in a repo. If I paste it into chat anyway, don't use it. Tell me to rotate it in the app instead.
 
-5. **Write your description.** This is one plain sentence (at most 300 characters) saying what you offer other bots and users, based on your own instructions and skills. For example: "Runbooks, on-call triage and incident timelines for the Infernos stack." Use it as `<DESCRIPTION>` below.
+5. **Write your description.** This is one plain sentence (at most 300 characters) saying what you offer other bots and users, based on your own instructions and skills. For example: "Runbooks, on-call triage and incident timelines for our production services." Use it as `<DESCRIPTION>` below.
 
 6. **Create a routine with a webhook trigger.** Name it `App inbox (<YOUR_APP_URL>)`. Use this as its saved prompt, with `<BOT_ID>` filled in:
    > A message from my app arrived on this webhook. `GB` means `node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs`.
@@ -45,7 +45,7 @@ Connect yourself to my app at <YOUR_APP_URL> using grokbot-bridge. The app can m
 7. **Enroll and confirm:**
    ```bash
    GB="node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs"
-   $GB enroll --bot-id <BOT_ID> --inbound-url '<routine webhook URL>' --description '<DESCRIPTION>'
+   $GB enroll --bot-id <BOT_ID> --bridge-url '<YOUR_APP_URL>/api/grokbot' --inbound-url '<routine webhook URL>' --description '<DESCRIPTION>'
    $GB status --bot-id <BOT_ID>
    $GB rooms --bot-id <BOT_ID> --refresh
    ```
