@@ -2,11 +2,14 @@
 // grokbot-bridge — zero-dependency CLI that connects a Grok Bot to an app's
 // /api/grokbot/* bridge route. Node 18+ built-ins only. MIT licensed.
 //
-//   node grokbot-bridge.mjs enroll --inbound-url <url> [--bot-id <id>] [--name <name>]
-//   node grokbot-bridge.mjs send   --text <text> [--in-reply-to <id>] [--conversation-id <id>]
-//   node grokbot-bridge.mjs verify [--body <json> | --body-file <path>]   (or stdin)
+//   node grokbot-bridge.mjs enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>]
+//   node grokbot-bridge.mjs send    --text <text> [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>]
+//   node grokbot-bridge.mjs verify  [--body <json> | --body-file <path>]   (or stdin)
+//   node grokbot-bridge.mjs rooms   [--refresh]
+//   node grokbot-bridge.mjs profile --description <text>
 //   node grokbot-bridge.mjs status
 //
+// --bot-id defaults to the only bot enrolled in state.json.
 // Exit codes: 0 ok, 1 usage/config/network error, 2 bad signature or stale
 // message, 3 duplicate message (already processed).
 
@@ -16,11 +19,12 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
 const MAX_TEXT_CHARS = 100_000;
+const MAX_DESCRIPTION_CHARS = 500;
 const SEEN_PER_BOT = 500;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
@@ -37,7 +41,7 @@ function fail(code, message) {
 }
 
 // ---------- args / env ----------
-const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json']);
+const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json', 'refresh']);
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -96,14 +100,28 @@ function loadState() {
   }
   return { version: 1, bots: {}, seen: {} };
 }
-function saveState(state) {
+function writeSecureJson(file, data) {
   mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
   try { chmodSync(HOME_DIR, 0o700); } catch {}
-  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', { mode: 0o600 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
   chmodSync(tmp, 0o600);
-  renameSync(tmp, STATE_FILE);
+  renameSync(tmp, file);
 }
+function saveState(state) { writeSecureJson(STATE_FILE, state); }
+
+// Per-bot rooms cache: the box is shared by several agents.
+function roomsFile(botId) { return join(HOME_DIR, `rooms.${botId}.json`); }
+function loadRooms(botId) {
+  try {
+    const c = JSON.parse(readFileSync(roomsFile(botId), 'utf8'));
+    if (c && Array.isArray(c.rooms)) return c;
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw new CliError(1, `cannot read ${roomsFile(botId)}: ${e.message}`);
+  }
+  return null;
+}
+function saveRooms(botId, cache) { writeSecureJson(roomsFile(botId), cache); }
 function selectBot(state, args) {
   const want = args['bot-id'] || process.env.GROKBOT_BOT_ID;
   const ids = Object.keys(state.bots);
@@ -263,16 +281,22 @@ async function cmdEnroll(args) {
   const secret = getEnv('GROKBOT_ENROLLMENT_SECRET');
   if (!secret) throw new CliError(1, 'GROKBOT_ENROLLMENT_SECRET is not set (add it via your secret input or ~/.grokbot-bridge/.env)');
   const { botId, name } = resolveIdentity(args);
+  const description = args.description ?? process.env.GROKBOT_BOT_DESCRIPTION;
+  if (description !== undefined && description.length > MAX_DESCRIPTION_CHARS) throw new CliError(1, `--description too long (max ${MAX_DESCRIPTION_CHARS} chars)`);
   const bridgeUrl = bridgeUrlFrom(args);
   const res = await http('POST', `${bridgeUrl}/enroll`, {
     headers: { authorization: `Bearer ${secret}` },
-    body: { botId, name, inboundUrl },
+    body: { botId, name, inboundUrl, ...(description !== undefined ? { description } : {}) },
   });
   if (typeof res.token !== 'string' || res.token.length < 20) throw new CliError(1, 'enroll response did not include a token');
   const state = loadState();
-  state.bots[botId] = { botId, name: res.bot?.name || name, token: res.token, inboundUrl: res.bot?.inboundUrl || inboundUrl, bridgeUrl, enrolledAt: res.bot?.updatedAt || new Date().toISOString() };
+  state.bots[botId] = {
+    botId, name: res.bot?.name || name, handle: res.handle || res.bot?.handle, description: res.bot?.description ?? description ?? '',
+    token: res.token, inboundUrl: res.bot?.inboundUrl || inboundUrl, bridgeUrl, enrolledAt: res.bot?.updatedAt || new Date().toISOString(),
+  };
   saveState(state);
-  out({ ok: true, botId, name: state.bots[botId].name, inboundUrl: state.bots[botId].inboundUrl, bridgeUrl, rotated: !!res.rotated, stateFile: STATE_FILE });
+  const b = state.bots[botId];
+  out({ ok: true, botId, name: b.name, handle: b.handle ? `@${b.handle}` : null, description: b.description, inboundUrl: b.inboundUrl, bridgeUrl, rotated: !!res.rotated, stateFile: STATE_FILE });
 }
 
 async function cmdSend(args) {
@@ -284,19 +308,23 @@ async function cmdSend(args) {
   if (text.length > MAX_TEXT_CHARS) throw new CliError(1, `text too long (${text.length} > ${MAX_TEXT_CHARS} chars)`);
   const type = args.type || (args['in-reply-to'] ? 'reply' : 'message');
   if (!['reply', 'message', 'event'].includes(type)) throw new CliError(1, '--type must be reply, message or event');
-  for (const k of ['in-reply-to', 'conversation-id', 'message-id']) {
+  for (const k of ['in-reply-to', 'conversation-id', 'message-id', 'room']) {
     if (args[k] !== undefined && !ID_RE.test(args[k])) throw new CliError(1, `invalid --${k}: ${args[k]}`);
   }
   const body = {
     type, botId: bot.botId, messageId: args['message-id'] || randomUUID(),
-    inReplyTo: args['in-reply-to'], conversationId: args['conversation-id'],
+    inReplyTo: args['in-reply-to'], conversationId: args['conversation-id'], roomId: args.room,
     text, sentAt: new Date().toISOString(),
   };
   const res = await http('POST', `${bridgeUrlFrom(args, bot)}/messages`, {
     headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId },
     body,
   });
-  out({ ok: true, messageId: res.messageId || body.messageId, duplicate: !!res.duplicate });
+  if (args.room) {
+    out({ ok: true, messageId: res.messageId || body.messageId, roomId: args.room, duplicate: !!res.duplicate, hop: res.hop, suppressed: res.suppressed ?? null, deliveredTo: (res.recipients || []).map((h) => `@${h}`) });
+  } else {
+    out({ ok: true, messageId: res.messageId || body.messageId, duplicate: !!res.duplicate });
+  }
 }
 
 async function cmdVerify(args) {
@@ -339,7 +367,51 @@ async function cmdVerify(args) {
     if (seen.length > SEEN_PER_BOT) seen.splice(0, seen.length - SEEN_PER_BOT);
     saveState(state);
   }
-  process.stdout.write(JSON.stringify(payload) + '\n');
+  process.stdout.write(JSON.stringify({ ...payload, _bridge: classify(bot.botId, payload) }) + '\n');
+}
+
+const NOTICE_TYPES = new Set(['room_member_joined', 'room_member_left', 'room_deleted']);
+const CLI_CMD = 'node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs';
+
+// Tell the routine what to do with a verified payload, and keep the rooms cache in sync.
+function classify(botId, p) {
+  if (NOTICE_TYPES.has(p.type)) {
+    const applied = applyNotice(botId, p);
+    return { kind: 'notice', noReply: true, reply: 'none', ...applied, cacheFile: roomsFile(botId), note: 'membership notice applied to the local rooms cache; do not reply' };
+  }
+  if (p.type === 'room_message') {
+    const cached = loadRooms(botId)?.rooms.find((r) => r.roomId === p.roomId);
+    const cachedRosterVersion = cached ? cached.rosterVersion : null;
+    const rosterStale = cachedRosterVersion === null || cachedRosterVersion < p.rosterVersion;
+    return {
+      kind: 'room', noReply: false, reply: 'optional', reason: p.reason,
+      rosterStale, cachedRosterVersion, rosterVersion: p.rosterVersion,
+      ...(rosterStale ? { hint: `run: ${CLI_CMD} rooms --bot-id ${botId} --refresh` } : {}),
+      replyWith: `${CLI_CMD} send --bot-id ${botId} --room ${p.roomId} --in-reply-to ${p.messageId}`,
+    };
+  }
+  return { kind: 'direct', noReply: false, reply: 'required', replyWith: `${CLI_CMD} send --bot-id ${botId} --in-reply-to ${p.messageId}` };
+}
+
+function applyNotice(botId, p) {
+  if (typeof p.roomId !== 'string' || !Number.isInteger(p.rosterVersion)) return { cacheUpdated: false, reason: 'malformed notice' };
+  const cache = loadRooms(botId) || { botId, self: p.self, fetchedAt: null, rooms: [] };
+  const idx = cache.rooms.findIndex((r) => r.roomId === p.roomId);
+  const cur = idx >= 0 ? cache.rooms[idx] : null;
+  if (cur && cur.rosterVersion > p.rosterVersion) return { cacheUpdated: false, reason: 'notice is older than the cache' };
+  const leftMe = p.type === 'room_member_left' && p.member?.botId === botId;
+  if (p.type === 'room_deleted' || leftMe) {
+    if (idx >= 0) cache.rooms.splice(idx, 1);
+  } else {
+    const roster = Array.isArray(p.roster) ? p.roster : [];
+    const me = roster.find((m) => m.botId === botId);
+    const view = { ...p.room, roomId: p.roomId, rosterVersion: p.rosterVersion, you: { listenAll: !!me?.listenAll }, members: roster };
+    if (idx >= 0) cache.rooms[idx] = view; else cache.rooms.push(view);
+  }
+  if (p.self) cache.self = p.self;
+  cache.updatedAt = new Date().toISOString();
+  saveRooms(botId, cache);
+  return { cacheUpdated: true, roomRemoved: p.type === 'room_deleted' || leftMe };
 }
 
 async function cmdStatus(args) {
@@ -351,7 +423,7 @@ async function cmdStatus(args) {
     return;
   }
   const bot = selectBot(state, args);
-  const local = { botId: bot.botId, name: bot.name, inboundUrl: bot.inboundUrl, bridgeUrl: bot.bridgeUrl, enrolledAt: bot.enrolledAt, token: `${bot.token.slice(0, 8)}…(${bot.token.length} chars)`, stateFile: STATE_FILE };
+  const local = { botId: bot.botId, name: bot.name, handle: bot.handle ? `@${bot.handle}` : null, inboundUrl: bot.inboundUrl, bridgeUrl: bot.bridgeUrl, enrolledAt: bot.enrolledAt, token: `${bot.token.slice(0, 4)}…(redacted, ${bot.token.length} chars)`, stateFile: STATE_FILE };
   if (args.offline) return out({ ok: true, enrolled: true, ...local });
   try {
     const res = await http('GET', `${bridgeUrlFrom(args, bot)}/me`, { headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId }, timeoutMs: Math.min(HTTP_TIMEOUT_MS, 6000) });
@@ -362,15 +434,45 @@ async function cmdStatus(args) {
   }
 }
 
+async function cmdRooms(args) {
+  const state = loadState();
+  const bot = selectBot(state, args);
+  const cached = loadRooms(bot.botId);
+  if (cached && !args.refresh) return out({ ok: true, cached: true, cacheFile: roomsFile(bot.botId), ...cached });
+  const res = await http('GET', `${bridgeUrlFrom(args, bot)}/rooms`, { headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId } });
+  if (!Array.isArray(res.rooms)) throw new CliError(1, 'rooms response did not include rooms');
+  const cache = { botId: bot.botId, self: res.self, fetchedAt: res.fetchedAt || new Date().toISOString(), rooms: res.rooms };
+  saveRooms(bot.botId, cache);
+  out({ ok: true, cached: false, cacheFile: roomsFile(bot.botId), ...cache });
+}
+
+async function cmdProfile(args) {
+  const state = loadState();
+  const bot = selectBot(state, args);
+  let description = args.description;
+  if (description === undefined) description = (await readStdin()).trim();
+  if (!description) throw new CliError(1, 'profile needs --description <text> (or text on stdin)');
+  if (description.length > MAX_DESCRIPTION_CHARS) throw new CliError(1, `description too long (${description.length} > ${MAX_DESCRIPTION_CHARS} chars)`);
+  const res = await http('POST', `${bridgeUrlFrom(args, bot)}/profile`, {
+    headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId },
+    body: { botId: bot.botId, description },
+  });
+  state.bots[bot.botId].description = res.bot?.description ?? description;
+  saveState(state);
+  out({ ok: true, botId: bot.botId, handle: bot.handle ? `@${bot.handle}` : null, description: state.bots[bot.botId].description });
+}
+
 function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 
 const HELP = `grokbot-bridge ${VERSION}
 Usage: node grokbot-bridge.mjs <command> [options]
-  enroll --inbound-url <url> [--bot-id <id>] [--name <name>] [--bridge-url <url>]
-  send   [--text <text>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event]   (text may come from stdin)
-  verify [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]   (body may come from stdin)
-  status [--offline]
-Global: --bot-id <id> (or GROKBOT_BOT_ID) when several bots share this box.
+  enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>]
+  send    [--text <text>] [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event]   (text may come from stdin)
+  verify  [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]   (body may come from stdin)
+  rooms   [--refresh]          rooms you are in + rosters (cached in ~/.grokbot-bridge/rooms.<botId>.json)
+  profile --description <text> update what you offer (max ${MAX_DESCRIPTION_CHARS} chars)
+  status  [--offline]
+Global: --bot-id <id> (or GROKBOT_BOT_ID). Defaults to the only bot enrolled in state.json; required when several are.
 Env: GROKBOT_BRIDGE_URL, GROKBOT_ENROLLMENT_SECRET (process env, ./.env, script-dir .env, or ~/.grokbot-bridge/.env)
 State: ${STATE_FILE} (0600)`;
 
@@ -378,8 +480,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
   if (!cmd || args.help || cmd === 'help') { process.stdout.write(HELP + '\n'); return; }
-  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus };
-  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, status)`);
+  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile };
+  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, rooms, profile, status)`);
   await commands[cmd](args);
 }
 

@@ -1,6 +1,6 @@
 # grokbot-bridge-plugin
 
-Connect any **Grok Bot** to your web app with async messages that are authenticated in both directions.
+Connect any **Grok Bot** to your web app with async messages that are authenticated in both directions. That covers direct messages and **app-hosted group rooms**, where bots and the app user talk and bots tag each other by `@handle`.
 
 The repo contains:
 
@@ -18,7 +18,7 @@ The repo contains:
     └──────────── POST <routine webhook URL> ◀──────────────────────┘
 ```
 
-The app is the only fixed address. Each bot tells the app where to reach it (its routine's webhook URL) when it enrolls.
+The app is the only fixed address. Each bot tells the app where to reach it (its routine's webhook URL) when it enrolls. The app also hosts rooms: it keeps the member lists and history, and it routes each room message only to the bots that need it.
 
 ## Quick start
 
@@ -36,18 +36,32 @@ node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs --help
 ## CLI
 
 ```
-node grokbot-bridge.mjs enroll --inbound-url <url> [--bot-id <id>] [--name <name>] [--bridge-url <url>]
-node grokbot-bridge.mjs send   [--text <text>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event] [--message-id <id>]
-node grokbot-bridge.mjs verify [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]
-node grokbot-bridge.mjs status [--offline]
+node grokbot-bridge.mjs enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>]
+node grokbot-bridge.mjs send    [--text <text>] [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event] [--message-id <id>]
+node grokbot-bridge.mjs verify  [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]
+node grokbot-bridge.mjs rooms   [--refresh]
+node grokbot-bridge.mjs profile --description <text>
+node grokbot-bridge.mjs status  [--offline]
 ```
+
+`--bot-id` defaults to the only bot enrolled in `state.json`. When several bots on a shared box are enrolled, it is required.
 
 | Command | What it does |
 |---|---|
-| `enroll` | POSTs `{botId, name, inboundUrl}` to `<bridge>/enroll` with the enrollment secret, then saves the returned per-bot token. `botId` and `name` are auto-detected from `/home/box/agent-data/agents/*/profile.json`. If more than one agent exists on the box, you must pass `--bot-id`. Re-running it rotates the token. |
-| `send` | Makes one authenticated POST to `<bridge>/messages`. Text comes from `--text` or stdin. `--in-reply-to` defaults `--type` to `reply`. A fresh `messageId` (UUID) is generated unless you pass `--message-id`, which makes the call safe to retry. |
-| `verify` | Reads the webhook body from `--body`, `--body-file`, or stdin. It checks the HMAC and freshness (±300 s by default), then prints the payload JSON on stdout. It also remembers the last 500 messageIds per bot and refuses duplicates. |
+| `enroll` | POSTs `{botId, name, inboundUrl, description?}` to `<bridge>/enroll` with the enrollment secret, then saves the returned per-bot token and the app-assigned `@handle`. `botId` and `name` are auto-detected from `/home/box/agent-data/agents/*/profile.json`. If more than one agent exists on the box, you must pass `--bot-id`. Re-running it rotates the token. |
+| `send` | Makes one authenticated POST to `<bridge>/messages`. Text comes from `--text` or stdin. `--room <roomId>` posts into a room, and the output lists `deliveredTo` handles, `hop`, and `suppressed`. `--in-reply-to` defaults `--type` to `reply`. A fresh `messageId` (UUID) is generated unless you pass `--message-id`, which makes the call safe to retry. |
+| `verify` | Reads the webhook body from `--body`, `--body-file`, or stdin. It checks the HMAC and freshness (±300 s by default), then prints the payload JSON plus a `_bridge` object (see below) on stdout. It remembers the last 500 messageIds per bot and refuses duplicates. Membership notices are applied to the rooms cache automatically. |
+| `rooms` | Prints the rooms you are in, with each room's `rosterVersion` and members (handle, name, description, listenAll, isSelf), plus `self`. It is served from `~/.grokbot-bridge/rooms.<botId>.json` (0600); `--refresh` fetches `GET <bridge>/rooms` first. |
+| `profile` | Updates your description (max 500 chars) with `POST <bridge>/profile`. |
 | `status` | Shows the local enrollment (token redacted) and checks the token against `<bridge>/me`. |
+
+**`verify` output: `_bridge`**
+
+| `kind` | When | Fields | What the routine does |
+|---|---|---|---|
+| `direct` | `type: "message"` | `reply: "required"`, `replyWith` | Acts, then runs `send --in-reply-to`. |
+| `room` | `type: "room_message"` | `reply: "optional"`, `reason`, `rosterStale`, `cachedRosterVersion`, `rosterVersion`, `hint`, `replyWith` | If the roster is stale, runs `rooms --refresh`. Replies in-room only when it has something useful to add. |
+| `notice` | `room_member_joined` / `room_member_left` / `room_deleted` | `noReply: true`, `reply: "none"`, `cacheUpdated`, `roomRemoved`, `cacheFile` | Nothing; verify has already updated the cache. |
 
 **Exit codes:** `0` ok · `1` usage, config, or network error · `2` bad signature, stale, or malformed message · `3` duplicate message (already processed).
 
@@ -64,7 +78,9 @@ node grokbot-bridge.mjs status [--offline]
 | `GROKBOT_BRIDGE_TIMEOUT_MS` | Optional HTTP timeout. Default 10000. |
 | `GROKBOT_AGENTS_DIR` | Optional. Default `/home/box/agent-data/agents`. |
 
-**State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, token, inboundUrl, bridgeUrl, enrolledAt } }, seen: { <botId>: [messageId…] } }`. Several bots on one shared box each get their own entry. The state file never lives in a repo.
+**State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, handle, description, token, inboundUrl, bridgeUrl, enrolledAt } }, seen: { <botId>: [messageId…] } }`. Several bots on one shared box each get their own entry.
+
+**Rooms cache.** Each bot has its own `~/.grokbot-bridge/rooms.<botId>.json` (0600), because the box is shared: `{ botId, self, fetchedAt, updatedAt, rooms: [{ roomId, name, description, rosterVersion, you: {listenAll}, members: [...] }] }`. `rooms --refresh` writes it, and membership notices update it in place. A notice older than the cached `rosterVersion` is ignored. Neither file ever lives in a repo.
 
 ## Security model
 
@@ -74,6 +90,22 @@ node grokbot-bridge.mjs status [--offline]
 - **App-to-bot signatures.** Every outbound message is signed with HMAC-SHA256. The **key is `sha256(token)`** as 32 raw bytes, not the token itself. The app never stores the raw token, so this is the strongest key both sides can derive. The consequence: anyone who can read the app's bot table could forge app-to-bot messages. They still could **not** impersonate a bot to the app, because that requires the token preimage. Re-enrolling rotates both values.
 - **Replay protection.** The bot rejects timestamps more than 5 minutes from its clock in either direction, and refuses messageIds it has already seen.
 - **Trust boundary.** A verified message proves it came from the app. It does not make the text safe. The setup prompt tells the bot to treat `payload.text` as a user request that never overrides its own rules and never reveals secrets.
+
+## Rooms
+
+The app owner creates rooms and adds or removes bots. Bots can't create rooms or join them on their own.
+
+- **Handles.** At enrollment the app assigns each bot a unique handle derived from its name: `Example Bot` becomes `@example-bot`, and collisions become `@example-bot-2`, `-3`, and so on. `all`, `everyone`, `here`, `channel`, and `room` are reserved. The handle stays the same when the bot re-enrolls, and only the app owner can rename it.
+- **Descriptions.** A bot sends a short `description` when it enrolls and can change it later with `profile`. Other bots read it in the roster to decide whom to tag.
+- **Routing.** A room message, whether from the app user or from a bot via `send --room`, is delivered only to:
+  - members tagged by `@handle` (or by raw `@<botId>` as a fallback),
+  - the author of the message it replies to (`inReplyTo`),
+  - members with `listenAll`.
+
+  A bot never receives its own message. A bot that isn't a member gets `403 not_a_member`.
+- **Loop guards.** Every message has a `hop`. App-user messages are hop 0. A bot message is its parent's hop + 1, where the parent is the `inReplyTo` message or, if that's missing, the newest message routed to that bot in the last 15 minutes. Past `maxHops` (default 4) the message is **stored in history but not delivered** (`suppressed: "hop_limit"`). Separately, bot-authored messages share a per-room token bucket (default burst 10, refilling at 10 per minute). When the bucket is empty, messages are stored but not delivered (`suppressed: "rate_limited"`). `send --room` prints `suppressed`.
+- **Roster versions.** Every membership change increments the room's `rosterVersion`. Handle renames and description changes do too, but without a notice. Every room delivery carries the current version, and `verify` flags `rosterStale` when the cache is behind, so the routine knows to run `rooms --refresh`.
+- **Self.** Every room payload (room message, notice, `GET /rooms`) includes `self: {botId, handle, name}` for the recipient, and the recipient's own roster entry has `isSelf: true`. Bots must never tag their own handle, and the app never delivers self-mentions anyway.
 
 ## Wire formats
 
@@ -85,12 +117,12 @@ All bodies are JSON, and all app responses follow `{ ok: true, … }` or `{ ok: 
 Authorization: Bearer <GROKBOT_ENROLLMENT_SECRET>
 Content-Type: application/json
 
-{"botId":"123e4567-e89b-12d3-a456-426614174000","name":"Example Bot","inboundUrl":"https://…/routine-webhook"}
+{"botId":"123e4567-e89b-12d3-a456-426614174000","name":"Example Bot","inboundUrl":"https://…/routine-webhook","description":"Runbooks and incident triage"}
 ```
-→ `201` (new) or `200` (re-enroll):
+→ `201` (new) or `200` (re-enroll; `description` is kept if omitted):
 ```json
-{"ok":true,"token":"gbt_…","tokenType":"Bearer","rotated":false,
- "bot":{"botId":"…","name":"…","inboundUrl":"…","createdAt":"…","updatedAt":"…","lastSeenAt":"…","revokedAt":null}}
+{"ok":true,"token":"gbt_…","tokenType":"Bearer","rotated":false,"handle":"example-bot",
+ "bot":{"botId":"…","name":"…","handle":"example-bot","description":"…","inboundUrl":"…","createdAt":"…","updatedAt":"…","lastSeenAt":"…","revokedAt":null}}
 ```
 Errors: `401 unauthorized` (bad secret) · `400 bad_request` · `403 bot_revoked` · `503 not_configured`.
 
@@ -102,7 +134,18 @@ x-grokbot-bot-id: <botId>
 
 {"type":"reply","botId":"…","messageId":"<uuid>","inReplyTo":"<app messageId>","conversationId":"…","text":"…","sentAt":"2026-10-08T03:39:31.575Z"}
 ```
-`type` is `reply`, `message`, or `event`. Messages are idempotent by `messageId`: the first delivery returns `202 {"ok":true,"messageId":"…","duplicate":false}`, and repeats return `200 {…,"duplicate":true}`. `GET <bridge>/me` with the same headers returns the bot record. `GET <bridge>/health` is public.
+`type` is `reply`, `message`, or `event`. Add `"roomId":"…"` to post into a room. The response is then `202 {"ok":true,"messageId","roomId","hop","suppressed":null|"hop_limit"|"rate_limited","recipients":["handle",…]}`, with `403 not_a_member` or `404 room_not_found` on errors. Messages are idempotent by `messageId`: the first delivery returns `202 {"ok":true,"messageId":"…","duplicate":false}`, and repeats return `200 {…,"duplicate":true}`. `GET <bridge>/me` with the same headers returns the bot record. `GET <bridge>/health` is public.
+
+### Profile and rooms lookup (bot token)
+
+- `POST <bridge>/profile` `{"description":"…"}` → `{"ok":true,"bot":{…}}`. Max 500 chars; whitespace is collapsed.
+- `GET <bridge>/rooms` →
+```json
+{"ok":true,"self":{"botId":"A","handle":"alpha-ops","name":"Alpha Ops"},"fetchedAt":"…",
+ "rooms":[{"roomId":"room_…","name":"War Room","description":"…","rosterVersion":3,"you":{"listenAll":false},
+   "members":[{"botId":"A","handle":"alpha-ops","name":"Alpha Ops","description":"…","listenAll":false,"isSelf":true},
+              {"botId":"B","handle":"bravo-research","name":"Bravo Research","description":"…","listenAll":false,"isSelf":false}]}]}
+```
 
 ### App to bot: `POST <inboundUrl>` (the routine webhook)
 
@@ -114,6 +157,28 @@ The default format is an **in-body envelope**, because the routine may only expo
 ```
 
 The same signature is also sent as the header `x-grokbot-signature: t=<t>,v1=<sig>` (plus `x-grokbot-message-id` and `x-grokbot-bot-id`). A receiver that sees headers but gets a bare payload body can use `verify --signature "<header>"`.
+
+Room payloads use the same envelope, with a different `payload.type`:
+
+```jsonc
+// room message (only to tagged / replied-to / listenAll members, never to its author)
+{"type":"room_message","messageId":"…","roomId":"room_…","room":{"roomId":"…","name":"War Room","description":"…"},
+ "rosterVersion":3,"self":{"botId":"B","handle":"bravo-research","name":"Bravo Research"},
+ "roster":[{"botId":"A","handle":"alpha-ops","name":"Alpha Ops","isSelf":false},{"botId":"B","handle":"bravo-research","name":"Bravo Research","isSelf":true}],
+ "author":{"kind":"bot","botId":"A","handle":"alpha-ops","name":"Alpha Ops"},   // or {"kind":"user","id?":"…","name":"Justin"}
+ "text":"@bravo-research can you find the RFC?","inReplyTo":"…?","mentions":[{"botId":"B","handle":"bravo-research"}],
+ "reason":"mention","hop":1,
+ "context":[{"messageId":"…","author":{…},"text":"…","createdAt":"…","truncated?":true}],   // last 10 by default
+ "sentAt":"…"}
+
+// membership notices: informational, never reply
+{"type":"room_member_joined" | "room_member_left" | "room_deleted","messageId":"…","roomId":"…","room":{…},
+ "rosterVersion":4,"self":{…},"member":{"botId":"C","handle":"charlie-notes","name":"…","description":"…","listenAll":false},
+ "roster":[{…,"isSelf":true}, …],   // after the change; [] for room_deleted and for the removed bot itself
+ "noReply":true,"sentAt":"…"}
+```
+
+On a join, every member (including the new one) gets `room_member_joined`. On a removal, the remaining members **and the removed bot** get `room_member_left`. When a room is deleted, every member gets `room_deleted`. The header `x-grokbot-payload-type` repeats `payload.type`.
 
 **Signature algorithm:**
 
@@ -140,6 +205,10 @@ valid    = constantTimeEqual(sig, expected) && |now - t| <= 300
 | `verify` exit 2 `bad signature` | The body was modified, the message was signed for another bot, or the token rotated after the app sent it. Pipe the **exact** body. |
 | `verify` exit 2 `stale message` | The message is more than 5 min old, or the clocks are skewed. Check `date -u`. Use `--max-age` only if you trust the transport. |
 | `verify` exit 3 `duplicate` | The message was already processed. Do nothing. |
+| `verify` prints `"rosterStale":true` | The room changed since you last looked. Run `rooms --bot-id <id> --refresh`. |
+| `send --room` → `HTTP 403: you are not a member` | You were removed or never added. Only the app owner manages membership. |
+| `send --room` prints `"suppressed":"hop_limit"` or `"rate_limited"` | The loop guard stored your message without delivering it. Stop the back-and-forth. |
+| `several bots are enrolled … pass --bot-id` | The shared box has several enrolled bots. Pass your own id to every command. |
 | `ECONNREFUSED` / `timed out` | The app is down or unreachable from the box. The CLI never retries on its own, so `send --message-id <same id>` is safe to repeat. |
 
 ## Development
@@ -149,3 +218,8 @@ node --test test/       # CLI self-tests (no deps)
 ```
 
 MIT © 2026 Infernos
+
+## Changelog
+
+- **0.2.0**: group rooms (`rooms`, `send --room`, `profile`, `enroll --description`), handles, auto-applied membership notices, the `_bridge` hint object in `verify` output, and `--bot-id` defaulting to the only enrolled bot.
+- **0.1.0**: enroll, send, verify, status.
