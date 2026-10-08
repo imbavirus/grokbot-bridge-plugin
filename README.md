@@ -29,7 +29,7 @@ The app is the only fixed address. Each bot tells the app where to reach it (its
 Manual install (all the bot needs is Node 18+ and either git or curl):
 
 ```bash
-git clone --depth 1 <PLUGIN_REPO_URL> ~/.grokbot-bridge/plugin
+git clone --depth 1 https://github.com/imbavirus/grokbot-bridge-plugin ~/.grokbot-bridge/plugin
 node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs --help
 ```
 

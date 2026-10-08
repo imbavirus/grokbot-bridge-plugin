@@ -1,6 +1,6 @@
 # Grok Bot setup prompt
 
-App owner: replace `<YOUR_APP_URL>` (e.g. `https://app.example.com`) and `<PLUGIN_REPO_URL>` (e.g. `https://github.com/you/grokbot-bridge-plugin`), then paste everything below the line into any Grok Bot. The same text works for every bot.
+App owner: replace `<YOUR_APP_URL>` (e.g. `https://app.example.com`) and `<PLUGIN_REPO_URL>` (e.g. `https://github.com/imbavirus/grokbot-bridge-plugin`, or your fork), then paste everything below the line into any Grok Bot. The same text works for every bot.
 
 ---
 
