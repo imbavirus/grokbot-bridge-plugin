@@ -7,6 +7,7 @@
 //   node grokbot-bridge.mjs verify  [--body <json> | --body-file <path>]   (or stdin)
 //   node grokbot-bridge.mjs rooms   [--refresh]
 //   node grokbot-bridge.mjs profile --description <text>
+//   node grokbot-bridge.mjs approval request|show|list|complete|fail|handoff ...
 //   node grokbot-bridge.mjs status
 //
 // --bot-id defaults to the only bot enrolled in state.json.
@@ -19,7 +20,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
@@ -27,13 +28,18 @@ const MAX_TEXT_CHARS = 100_000;
 const MAX_DESCRIPTION_CHARS = 500;
 const SEEN_PER_BOT = 500;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const APPROVAL_ID_RE = /^apr_[A-Za-z0-9_-]{8,64}$/;
+const CODE_RE = /^gbe_[A-Za-z0-9_-]{20,200}$/;
+const APPROVALS_PER_BOT = 50;
+const CREATE_BOT_NAME_MAX = 60;
+const CREATE_BOT_TEXT_MAX = 2000;
 
 // Never hang: hard watchdog for the whole process.
 const watchdog = setTimeout(() => fail(1, `timed out after ${HARD_DEADLINE_MS}ms`), HARD_DEADLINE_MS);
 watchdog.unref();
 
 class CliError extends Error {
-  constructor(code, message) { super(message); this.exitCode = code; }
+  constructor(code, message, extra = {}) { super(message); this.exitCode = code; Object.assign(this, extra); }
 }
 function note(message) {
   // eslint-disable-next-line no-control-regex
@@ -52,7 +58,7 @@ function fail(code, message) {
 }
 
 // ---------- args / env ----------
-const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json', 'refresh']);
+const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote']);
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -269,7 +275,7 @@ async function http(method, url, { headers = {}, body, timeoutMs = HTTP_TIMEOUT_
     const msg = json?.error?.message || json?.error?.code
       || (json === undefined ? `non-JSON response (${(res.headers.get('content-type') || 'unknown type').split(';')[0]}); does GROKBOT_BRIDGE_URL point at the app's /api/grokbot route?` : '')
       || res.statusText;
-    throw new CliError(1, `${method} ${url} -> HTTP ${res.status}: ${msg}`);
+    throw new CliError(1, `${method} ${url} -> HTTP ${res.status}: ${msg}`, { httpStatus: res.status, errorCode: json?.error?.code });
   }
   if (json === undefined) throw new CliError(1, `${method} ${url} returned non-JSON`);
   return json;
@@ -289,25 +295,42 @@ async function cmdEnroll(args) {
   const inboundUrl = args['inbound-url'];
   if (!inboundUrl) throw new CliError(1, 'enroll needs --inbound-url <your routine webhook URL>');
   try { new URL(inboundUrl); } catch { throw new CliError(1, `--inbound-url is not a valid URL: ${inboundUrl}`); }
-  const secret = getEnv('GROKBOT_ENROLLMENT_SECRET');
-  if (!secret) throw new CliError(1, 'GROKBOT_ENROLLMENT_SECRET is not set (add it via your secret input or ~/.grokbot-bridge/.env)');
+  // A one-time enrollment code (from an approved create_bot handoff) replaces the shared secret.
+  const code = args['enrollment-code'] || process.env.GROKBOT_ENROLLMENT_CODE;
+  if (code !== undefined && code !== '' && !CODE_RE.test(code)) throw new CliError(1, 'enrollment code must look like gbe_... (copy it exactly from the handoff)');
+  const secret = code || getEnv('GROKBOT_ENROLLMENT_SECRET');
+  if (!secret) throw new CliError(1, 'GROKBOT_ENROLLMENT_SECRET is not set (add it via your secret input or ~/.grokbot-bridge/.env), and no --enrollment-code was given');
   const { botId, name } = resolveIdentity(args);
   const description = args.description ?? process.env.GROKBOT_BOT_DESCRIPTION;
   if (description !== undefined && description.length > MAX_DESCRIPTION_CHARS) throw new CliError(1, `--description too long (max ${MAX_DESCRIPTION_CHARS} chars)`);
   const bridgeUrl = bridgeUrlFrom(args);
-  const res = await http('POST', `${bridgeUrl}/enroll`, {
-    headers: { authorization: `Bearer ${secret}` },
-    body: { botId, name, inboundUrl, ...(description !== undefined ? { description } : {}) },
-  });
+  let res;
+  try {
+    res = await http('POST', `${bridgeUrl}/enroll`, {
+      headers: { authorization: `Bearer ${secret}` },
+      body: { botId, name, inboundUrl, ...(description !== undefined ? { description } : {}) },
+    });
+  } catch (e) {
+    if (code && e instanceof CliError && e.httpStatus === 401) {
+      throw new CliError(1, 'enrollment code is invalid, already used, or expired; it cannot be reused. Ask your creator bot or the app owner to have the app re-send the approval (a new code)', e);
+    }
+    throw e;
+  }
   if (typeof res.token !== 'string' || res.token.length < 20) throw new CliError(1, 'enroll response did not include a token');
   const state = loadState();
+  const prev = state.bots[botId];
   state.bots[botId] = {
+    ...(prev?.approvals ? { approvals: prev.approvals } : {}),
     botId, name: res.bot?.name || name, handle: res.handle || res.bot?.handle, description: res.bot?.description ?? description ?? '',
     token: res.token, inboundUrl: res.bot?.inboundUrl || inboundUrl, bridgeUrl, enrolledAt: res.bot?.updatedAt || new Date().toISOString(),
   };
   saveState(state);
   const b = state.bots[botId];
-  out({ ok: true, botId, name: b.name, handle: b.handle ? `@${b.handle}` : null, description: b.description, inboundUrl: b.inboundUrl, bridgeUrl, rotated: !!res.rotated, stateFile: STATE_FILE });
+  out({
+    ok: true, botId, name: b.name, handle: b.handle ? `@${b.handle}` : null, description: b.description, inboundUrl: b.inboundUrl, bridgeUrl, rotated: !!res.rotated,
+    ...(code ? { enrolledWith: 'enrollment_code', createdByBotId: res.bot?.createdByBotId ?? null, approvalId: res.bot?.approvalId ?? null } : {}),
+    stateFile: STATE_FILE,
+  });
 }
 
 async function cmdSend(args) {
@@ -379,18 +402,26 @@ async function cmdVerify(args) {
   const skew = Math.floor(Date.now() / 1000) - t;
   if (Math.abs(skew) > maxAge) throw new CliError(2, `stale message: timestamp is ${skew}s off (limit ${maxAge}s); possible replay`);
 
+  const isAction = ACTION_TYPES.has(payload.type);
+  if (isAction) checkActionPayload(payload); // exit 2 on a params/paramsHash mismatch
+
   const id = payload.messageId;
+  let dirty = false;
   if (!args['no-dedupe'] && typeof id === 'string') {
     const seen = (state.seen[bot.botId] ||= []);
     if (seen.includes(id)) throw new CliError(3, `duplicate message ${id} (already processed)`);
     seen.push(id);
     if (seen.length > SEEN_PER_BOT) seen.splice(0, seen.length - SEEN_PER_BOT);
-    saveState(state);
+    dirty = true;
   }
-  process.stdout.write(JSON.stringify({ ...payload, _bridge: classify(bot.botId, payload) }) + '\n');
+  if (isAction) { storeAction(state.bots[bot.botId], payload); dirty = true; }
+  if (dirty) saveState(state);
+  const shown = isAction && payload.enrollmentCode ? { ...payload, enrollmentCode: redactCode(payload.enrollmentCode) } : payload;
+  process.stdout.write(JSON.stringify({ ...shown, _bridge: classify(bot.botId, payload) }) + '\n');
 }
 
 const NOTICE_TYPES = new Set(['room_member_joined', 'room_member_left', 'room_deleted']);
+const ACTION_TYPES = new Set(['approval_decision', 'action_request']);
 const CLI_CMD = 'node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs';
 
 // Tell the routine what to do with a verified payload, and keep the rooms cache in sync.
@@ -410,6 +441,7 @@ function classify(botId, p) {
       replyWith: `${CLI_CMD} send --bot-id ${botId} --room ${p.roomId} --in-reply-to ${p.messageId}`,
     };
   }
+  if (ACTION_TYPES.has(p.type)) return classifyAction(botId, p);
   return { kind: 'direct', noReply: false, reply: 'required', replyWith: `${CLI_CMD} send --bot-id ${botId} --in-reply-to ${p.messageId}` };
 }
 
@@ -434,6 +466,228 @@ function applyNotice(botId, p) {
   return { cacheUpdated: true, roomRemoved: p.type === 'room_deleted' || leftMe };
 }
 
+// ---------- approvals ----------
+function redactCode(c) { return typeof c === 'string' && c ? `${c.slice(0, 4)}…(redacted, ${c.length} chars)` : c; }
+function hashParams(params) { return createHash('sha256').update(canonicalJson(params), 'utf8').digest('hex'); }
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+function checkActionPayload(p) {
+  if (typeof p.approvalId !== 'string' || !APPROVAL_ID_RE.test(p.approvalId)) throw new CliError(2, 'action payload has no valid approvalId');
+  if (!p.params || typeof p.params !== 'object' || Array.isArray(p.params)) throw new CliError(2, 'action payload has no params object');
+  if (typeof p.paramsHash !== 'string' || !safeEqualHex(p.paramsHash, hashParams(p.params))) {
+    throw new CliError(2, 'paramsHash does not match params (tampered or corrupted action); do not act on it');
+  }
+  if (!['approved', 'denied', 'expired'].includes(p.status)) throw new CliError(2, `unknown action status ${String(p.status).slice(0, 20)}`);
+  if (p.enrollmentCode !== undefined && (typeof p.enrollmentCode !== 'string' || !CODE_RE.test(p.enrollmentCode))) throw new CliError(2, 'malformed enrollment code in action payload');
+}
+
+function storeAction(bot, p) {
+  const list = (bot.approvals ||= {});
+  const prev = list[p.approvalId] || {};
+  list[p.approvalId] = {
+    ...prev,
+    approvalId: p.approvalId, kind: p.kind, origin: p.type === 'action_request' ? 'app' : 'self', status: p.status,
+    params: p.params, paramsHash: p.paramsHash,
+    ...(p.note ? { note: p.note } : {}), ...(p.reason ? { reason: p.reason } : {}),
+    decidedBy: p.decidedBy ?? null, decidedAt: p.decidedAt ?? null, expiresAt: p.expiresAt ?? null,
+    ...(p.enrollmentCode ? { enrollmentCode: p.enrollmentCode, enrollmentCodeExpiresAt: p.enrollmentCodeExpiresAt ?? null } : {}),
+    receivedAt: new Date().toISOString(),
+  };
+  if (p.status !== 'approved') delete list[p.approvalId].enrollmentCode;
+  const ids = Object.keys(list);
+  if (ids.length > APPROVALS_PER_BOT) {
+    ids.sort((a, b) => String(list[a].receivedAt || list[a].requestedAt || '').localeCompare(String(list[b].receivedAt || list[b].requestedAt || '')));
+    for (const old of ids.slice(0, ids.length - APPROVALS_PER_BOT)) delete list[old];
+  }
+}
+
+function classifyAction(botId, p) {
+  const action = { approvalId: p.approvalId, kind: p.kind, status: p.status, params: p.params };
+  const base = { kind: 'action', noReply: true, reply: 'none', action, origin: p.type === 'action_request' ? 'app' : 'your_request' };
+  const id = p.approvalId;
+  if (p.status !== 'approved') return { ...base, next: `approval ${p.status}: do nothing, stop silently` };
+  const complete = `${CLI_CMD} approval complete --bot-id ${botId} --id ${id} --result '<json>'`;
+  const failWith = `${CLI_CMD} approval fail --bot-id ${botId} --id ${id} --error '<one line>'`;
+  if (p.kind === 'create_bot') {
+    return {
+      ...base,
+      next: 'create a new teammate bot with EXACTLY params.name and params.description; message it the output of handoffWith; then run completeWith (or failWith if creation failed)',
+      ...(p.enrollmentCode ? { enrollmentCode: redactCode(p.enrollmentCode), enrollmentCodeExpiresAt: p.enrollmentCodeExpiresAt ?? null } : {}),
+      handoffWith: `${CLI_CMD} approval handoff --bot-id ${botId} --id ${id}`,
+      completeWith: `${CLI_CMD} approval complete --bot-id ${botId} --id ${id} --result '{"createdBotId":"<new bot id>","createdBotName":"<name>"}'`,
+      failWith,
+    };
+  }
+  return { ...base, next: `approved ${p.kind}: perform it only if you know how; then run completeWith (or failWith)`, completeWith: complete, failWith };
+}
+
+function redactApproval(a) {
+  if (!a) return a;
+  const { enrollmentCode, ...rest } = a;
+  return { ...rest, ...(enrollmentCode ? { enrollmentCode: redactCode(enrollmentCode) } : {}) };
+}
+
+function approvalIdArg(args) {
+  const id = args.id || args['approval-id'];
+  if (!id || !APPROVAL_ID_RE.test(id)) throw new CliError(1, 'needs --id <approvalId> (apr_...)');
+  return id;
+}
+
+function botHeaders(bot) { return { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId }; }
+
+function parseJsonArg(raw, flag) {
+  let v;
+  try { v = JSON.parse(raw); } catch { throw new CliError(1, `--${flag} must be JSON`); }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new CliError(1, `--${flag} must be a JSON object`);
+  return v;
+}
+
+async function approvalRequest(args, state, bot) {
+  const kind = args.kind || 'create_bot';
+  if (!/^[a-z][a-z0-9_]{0,39}$/.test(kind)) throw new CliError(1, 'invalid --kind');
+  let params;
+  if (args.params !== undefined) params = parseJsonArg(args.params, 'params');
+  else if (kind === 'create_bot') {
+    const name = String(args.name ?? '').replace(/\s+/g, ' ').trim();
+    if (!name) throw new CliError(1, 'approval request --kind create_bot needs --name <name> (and --description <text>)');
+    if (name.length > CREATE_BOT_NAME_MAX) throw new CliError(1, `--name too long (max ${CREATE_BOT_NAME_MAX} chars)`);
+    const description = String(args.description ?? '');
+    if (description.length > CREATE_BOT_TEXT_MAX) throw new CliError(1, `--description too long (max ${CREATE_BOT_TEXT_MAX} chars)`);
+    if (args.purpose !== undefined && String(args.purpose).length > CREATE_BOT_TEXT_MAX) throw new CliError(1, `--purpose too long (max ${CREATE_BOT_TEXT_MAX} chars)`);
+    params = { name, description, ...(args.purpose ? { purpose: String(args.purpose) } : {}) };
+  } else throw new CliError(1, `approval request --kind ${kind} needs --params '<json object>'`);
+  const requestId = args['request-id'] || randomUUID();
+  if (!ID_RE.test(requestId)) throw new CliError(1, 'invalid --request-id');
+  const res = await http('POST', `${bridgeUrlFrom(args, bot)}/approvals`, {
+    headers: botHeaders(bot),
+    body: { botId: bot.botId, kind, params, ...(args.reason ? { reason: String(args.reason) } : {}), requestId },
+  });
+  if (typeof res.approvalId !== 'string' || !APPROVAL_ID_RE.test(res.approvalId)) throw new CliError(1, 'approval response did not include an approvalId');
+  const list = (state.bots[bot.botId].approvals ||= {});
+  const requestedAt = list[res.approvalId]?.requestedAt || new Date().toISOString();
+  list[res.approvalId] = { ...(list[res.approvalId] || {}), approvalId: res.approvalId, kind, origin: 'self', status: res.status || 'pending', params, paramsHash: res.paramsHash ?? hashParams(params), requestedAt, expiresAt: res.expiresAt ?? null };
+  // App policy decided on the spot (create-bots policy "auto" or the app's approvalPolicy hook):
+  // the decision (with the one-time code when approved) comes back in this response, not on the webhook.
+  const d = res.decision;
+  const sync = !!(d && typeof d === 'object' && d.approvalId === res.approvalId && (d.status === 'approved' || d.status === 'denied'));
+  if (sync) {
+    checkActionPayload(d); // same paramsHash check as verify
+    if (d.paramsHash !== hashParams(params)) throw new CliError(2, 'the app decided on different params than requested; do not act on it');
+    storeAction(state.bots[bot.botId], d);
+    list[res.approvalId].requestedAt = requestedAt;
+  }
+  saveState(state);
+  const auto = sync && d.status === 'approved';
+  const extra = sync && !auto
+    ? { decidedBy: d.decidedBy ?? null, ...(d.reason ? { reason: d.reason } : {}), next: 'denied by the app: do not create it; tell the requester it was not approved' }
+    : auto
+    ? {
+        autoApproved: true, decidedBy: d.decidedBy ?? null,
+        ...(d.enrollmentCode ? { enrollmentCode: redactCode(d.enrollmentCode), enrollmentCodeExpiresAt: d.enrollmentCodeExpiresAt ?? null } : {}),
+        next: kind === 'create_bot'
+          ? 'approved now: create the bot with EXACTLY these params, send it the output of handoffWith, then run completeWith'
+          : 'approved now: perform it, then run completeWith',
+        ...(kind === 'create_bot' ? { handoffWith: `${CLI_CMD} approval handoff --bot-id ${bot.botId} --id ${res.approvalId}` } : {}),
+        completeWith: `${CLI_CMD} approval complete --bot-id ${bot.botId} --id ${res.approvalId} --result '<json>'`,
+      }
+    : { hint: 'tell the requester it is awaiting approval in the app; the decision arrives on your webhook' };
+  out({ ok: true, approvalId: res.approvalId, status: sync ? d.status : res.status || 'pending', kind, params, expiresAt: res.expiresAt ?? null, ...(res.duplicate ? { duplicate: true } : {}), ...extra });
+}
+
+async function approvalFinish(args, state, bot, outcome) {
+  const id = approvalIdArg(args);
+  let body;
+  if (outcome === 'complete') body = { botId: bot.botId, result: args.result === undefined ? {} : parseJsonArg(args.result, 'result') };
+  else {
+    const error = String(args.error ?? '').trim();
+    if (!error) throw new CliError(1, "approval fail needs --error '<one line>'");
+    body = { botId: bot.botId, error: error.slice(0, 2000) };
+  }
+  const list = (state.bots[bot.botId].approvals ||= {});
+  let res;
+  try {
+    res = await http('POST', `${bridgeUrlFrom(args, bot)}/approvals/${encodeURIComponent(id)}/${outcome}`, { headers: botHeaders(bot), body });
+  } catch (e) {
+    if (e instanceof CliError && e.errorCode === 'already_completed') {
+      if (list[id]) { list[id].status = /failed/.test(e.message) ? 'failed' : 'completed'; delete list[id].enrollmentCode; saveState(state); }
+      note('already finished on the app side; nothing more to do');
+      return out({ ok: true, approvalId: id, alreadyFinished: true, message: e.message.replace(/^.*HTTP 409: /, '') });
+    }
+    throw e;
+  }
+  if (list[id]) {
+    list[id].status = res.approval?.status || (outcome === 'complete' ? 'completed' : 'failed');
+    list[id].completedAt = res.approval?.completedAt || new Date().toISOString();
+    delete list[id].enrollmentCode; // no longer needed by us; the new bot already has it (or the action failed)
+    saveState(state);
+  }
+  out({ ok: true, approvalId: id, status: res.approval?.status || (outcome === 'complete' ? 'completed' : 'failed') });
+}
+
+async function approvalShow(args, state, bot) {
+  const id = approvalIdArg(args);
+  const local = state.bots[bot.botId].approvals?.[id];
+  if (local && !args.remote) return out({ ok: true, source: 'local', approval: redactApproval(local) });
+  const res = await http('GET', `${bridgeUrlFrom(args, bot)}/approvals/${encodeURIComponent(id)}`, { headers: botHeaders(bot) });
+  if (local && res.approval?.status) { local.status = res.approval.status; if (!['approved'].includes(local.status)) delete local.enrollmentCode; saveState(state); }
+  out({ ok: true, source: 'app', approval: res.approval, ...(local ? { local: redactApproval(local) } : {}) });
+}
+
+function readSetupPrompt() {
+  try {
+    const text = readFileSync(join(SCRIPT_DIR, 'SETUP_PROMPT.md'), 'utf8');
+    const i = text.indexOf('\n---\n');
+    return i >= 0 ? text.slice(i + 5).trim() : null;
+  } catch { return null; }
+}
+
+function approvalHandoff(args, state, bot) {
+  const id = approvalIdArg(args);
+  const a = state.bots[bot.botId].approvals?.[id];
+  if (!a) throw new CliError(1, `approval ${id} is not stored for bot ${bot.botId}; it arrives with a verified approval_decision/action_request`);
+  if (a.kind !== 'create_bot') throw new CliError(1, `approval ${id} is ${a.kind}, not create_bot`);
+  if (a.status !== 'approved') throw new CliError(1, `approval ${id} is ${a.status}; nothing to hand off`);
+  if (!a.enrollmentCode) throw new CliError(1, `no enrollment code stored for ${id} (already completed or handed off?)`);
+  if (a.enrollmentCodeExpiresAt && Date.parse(a.enrollmentCodeExpiresAt) <= Date.now()) {
+    throw new CliError(1, `the enrollment code for ${id} expired at ${a.enrollmentCodeExpiresAt}; ask the app owner to re-send the approval (redeliverApproval)`);
+  }
+  const bridgeUrl = bridgeUrlFrom(args, bot);
+  const appUrl = bridgeUrl.endsWith('/api/grokbot') ? bridgeUrl.slice(0, -'/api/grokbot'.length) : new URL(bridgeUrl).origin;
+  const name = String(a.params?.name ?? '');
+  const prompt = readSetupPrompt();
+  const fill = (t) => t.split('<YOUR_APP_URL>/api/grokbot').join(bridgeUrl).split('<YOUR_APP_URL>').join(appUrl);
+  const enrollLine = `node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs enroll --bot-id <BOT_ID> --name ${shq(name)} --bridge-url ${shq(bridgeUrl)} --inbound-url '<routine webhook URL>' --description '<DESCRIPTION>' --enrollment-code ${shq(a.enrollmentCode)}`;
+  const text = [
+    `=== grokbot-bridge handoff: connect "${name}" to ${appUrl} ===`,
+    `You were just created as "${name}" by your teammate ${bot.name || bot.botId}${bot.handle ? ` (@${bot.handle})` : ''}. The app owner approved this in the app (approval ${id}). Connect yourself to the app by following the setup prompt below, with these changes:`,
+    `- Skip step 4. You do not need the enrollment secret. Instead you have a one-time enrollment code (below). It works once, only for a bot named exactly "${name}", and expires at ${a.enrollmentCodeExpiresAt || 'within the hour'} (UTC). Never print it, log it, store it in a file, or pass it on.`,
+    `- In step 7, enroll with this command instead (fill in <BOT_ID>, <routine webhook URL> and <DESCRIPTION> as the steps describe; keep the name exactly as shown):`,
+    `  ${enrollLine}`,
+    `- If enroll says the code is invalid, used or expired, stop and say so. A code cannot be reused.`,
+    '',
+    prompt ? '--- setup prompt ---' : `--- setup prompt: fetch it with: curl -fsSL https://raw.githubusercontent.com/imbavirus/grokbot-bridge-plugin/main/SETUP_PROMPT.md (use the text below its --- line; replace <YOUR_APP_URL> with ${appUrl}) ---`,
+    ...(prompt ? [fill(prompt)] : []),
+    '=== end of handoff ===',
+  ].join('\n');
+  if (args.json) return out({ ok: true, approvalId: id, name, appUrl, bridgeUrl, enrollmentCodeExpiresAt: a.enrollmentCodeExpiresAt ?? null, text });
+  process.stdout.write(text + '\n');
+  note('the handoff contains the one-time enrollment code: send it only to the new bot');
+}
+
+async function cmdApproval(args) {
+  const sub = args._[1];
+  const subs = { request: approvalRequest, show: approvalShow, list: null, complete: null, fail: null, handoff: approvalHandoff };
+  if (!sub || !(sub in subs)) throw new CliError(1, 'usage: approval request|show|list|complete|fail|handoff (see --help)');
+  const state = loadState();
+  const bot = selectBot(state, args);
+  if (sub === 'list') {
+    const list = Object.values(bot.approvals || {}).map(redactApproval);
+    return out({ ok: true, botId: bot.botId, approvals: list });
+  }
+  if (sub === 'complete' || sub === 'fail') return approvalFinish(args, state, bot, sub);
+  return subs[sub](args, state, bot);
+}
+
 async function cmdStatus(args) {
   const state = loadState();
   const ids = Object.keys(state.bots);
@@ -447,7 +701,12 @@ async function cmdStatus(args) {
   if (args.offline) return out({ ok: true, enrolled: true, ...local });
   try {
     const res = await http('GET', `${bridgeUrlFrom(args, bot)}/me`, { headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId }, timeoutMs: Math.min(HTTP_TIMEOUT_MS, 6000) });
-    out({ ok: true, enrolled: true, tokenValid: true, ...local, server: res.bot });
+    out({
+      ok: true, enrolled: true, tokenValid: true, ...local,
+      // Bot creation: only the app's designated creator bot may create bots ('approval' or 'auto'); everyone else is 'none'.
+      createBotsPolicy: res.createBotsPolicy ?? 'none', creator: res.creator ?? null,
+      server: res.bot,
+    });
   } catch (e) {
     out({ ok: false, enrolled: true, tokenValid: false, ...local, error: e.message });
     process.exitCode = 1;
@@ -461,7 +720,7 @@ async function cmdRooms(args) {
   if (cached && !args.refresh) return out({ ok: true, cached: true, cacheFile: roomsFile(bot.botId), ...cached });
   const res = await http('GET', `${bridgeUrlFrom(args, bot)}/rooms`, { headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId } });
   if (!Array.isArray(res.rooms)) throw new CliError(1, 'rooms response did not include rooms');
-  const cache = { botId: bot.botId, self: res.self, fetchedAt: res.fetchedAt || new Date().toISOString(), rooms: res.rooms };
+  const cache = { botId: bot.botId, self: res.self, ...(res.createBotsPolicy ? { createBotsPolicy: res.createBotsPolicy } : {}), creator: res.creator ?? null, fetchedAt: res.fetchedAt || new Date().toISOString(), rooms: res.rooms };
   saveRooms(bot.botId, cache);
   out({ ok: true, cached: false, cacheFile: roomsFile(bot.botId), ...cache });
 }
@@ -486,22 +745,29 @@ function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 
 const HELP = `grokbot-bridge ${VERSION}
 Usage: node grokbot-bridge.mjs <command> [options]
-  enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>]
+  enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>] [--enrollment-code gbe_...]
   send    [--text <text>] [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event]   (text may come from stdin)
   verify  [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]   (body may come from stdin)
   rooms   [--refresh]          rooms you are in + rosters (cached in ~/.grokbot-bridge/rooms.<botId>.json)
   profile --description <text> update what you offer (max ${MAX_DESCRIPTION_CHARS} chars)
   status  [--offline]
+  approval request [--kind create_bot] --name <name> --description <text> [--purpose <text>] [--reason <text>]   (other kinds: --params '<json>')
+  approval show --id <approvalId> [--remote]     stored approval (enrollment code redacted); --remote asks the app
+  approval list                                  approvals stored for this bot (redacted)
+  approval complete --id <approvalId> [--result '<json>']
+  approval fail --id <approvalId> --error '<one line>'
+  approval handoff --id <approvalId> [--json]    setup block for the bot you created (contains its one-time code)
 Global: --bot-id <id> (or GROKBOT_BOT_ID). Defaults to the only bot enrolled in state.json; required when several are.
 Env: GROKBOT_BRIDGE_URL, GROKBOT_ENROLLMENT_SECRET (process env, ./.env, script-dir .env, or ~/.grokbot-bridge/.env)
+     GROKBOT_ENROLLMENT_CODE (process env only): one-time code instead of the secret
 State: ${STATE_FILE} (0600)`;
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
   if (!cmd || args.help || cmd === 'help') { process.stdout.write(HELP + '\n'); return; }
-  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile };
-  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, rooms, profile, status)`);
+  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile, approval: cmdApproval };
+  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, rooms, profile, approval, status)`);
   await commands[cmd](args);
 }
 

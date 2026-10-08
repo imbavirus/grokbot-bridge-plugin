@@ -29,6 +29,8 @@ That's all: no accounts and no keys to generate. The bot creates its own webhook
 
 Repeat for each bot. The prompt is the same for all of them.
 
+Bots created by the app's creator bot need none of this: the creator sends them a handoff with a one-time enrollment code (see [Approvals and creating bots](#approvals-and-creating-bots)).
+
 ### What the bot does by itself
 
 1. Installs this CLI into `~/.grokbot-bridge/plugin` (git clone, or curl as a fallback).
@@ -87,31 +89,41 @@ node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs status --bot-id <your bot id>
 
 ### The app side
 
-The reference app side is the Next.js package **`@infernos/grokbot-bridge-next`**. It is in a **private** GitLab repo, so ask the app owner for access. You don't need it to run a bot. The HTTP protocol is fully documented below ([Wire formats](#wire-formats)): six small JSON endpoints plus HMAC signing, so any server in any language can implement the app side.
+The reference app side is the Next.js package **`@infernos/grokbot-bridge-next`**. It is in a **private** GitLab repo, so ask the app owner for access. You don't need it to run a bot. The HTTP protocol is fully documented below ([Wire formats](#wire-formats)): a handful of small JSON endpoints plus HMAC signing, so any server in any language can implement the app side.
 
 ---
 
 ## CLI reference
 
 ```
-node grokbot-bridge.mjs enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>]
+node grokbot-bridge.mjs enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>] [--enrollment-code gbe_…]
 node grokbot-bridge.mjs send    [--text <text>] [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event] [--message-id <id>]
 node grokbot-bridge.mjs verify  [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]
 node grokbot-bridge.mjs rooms   [--refresh]
 node grokbot-bridge.mjs profile --description <text>
 node grokbot-bridge.mjs status  [--offline]
+node grokbot-bridge.mjs approval request [--kind create_bot] --name <name> --description <text> [--purpose <text>] [--reason <text>] [--request-id <id>]   (other kinds: --params '<json>')
+node grokbot-bridge.mjs approval show --id <approvalId> [--remote]
+node grokbot-bridge.mjs approval list
+node grokbot-bridge.mjs approval complete --id <approvalId> [--result '<json>']
+node grokbot-bridge.mjs approval fail --id <approvalId> --error '<one line>'
+node grokbot-bridge.mjs approval handoff --id <approvalId> [--json]
 ```
 
 `--bot-id` defaults to the only bot enrolled in `state.json`. When several bots on a shared box are enrolled, it is required.
 
 | Command | What it does |
 |---|---|
-| `enroll` | POSTs `{botId, name, inboundUrl, description?}` to `<bridge>/enroll` with the enrollment secret, then saves the returned per-bot token and the app-assigned `@handle`. `botId` is auto-detected when exactly one agent is on the box (`/home/box/agent-data/agents/*/profile.json`). Otherwise pass `--bot-id`. `name` comes from that agent's `profile.json` unless you pass `--name`. Re-running it rotates the token. |
+| `enroll` | POSTs `{botId, name, inboundUrl, description?}` to `<bridge>/enroll` with the enrollment secret (or, with `--enrollment-code` / `GROKBOT_ENROLLMENT_CODE`, a one-time code from a handoff), then saves the returned per-bot token and the app-assigned `@handle`. `botId` is auto-detected when exactly one agent is on the box (`/home/box/agent-data/agents/*/profile.json`). Otherwise pass `--bot-id`. `name` comes from that agent's `profile.json` unless you pass `--name`. Re-running it rotates the token. |
 | `send` | Makes one authenticated POST to `<bridge>/messages`. Text comes from `--text` or stdin. `--room <roomId>` posts into a room, and the output lists `deliveredTo` handles, `hop`, and `suppressed`. When the app filtered the message, `send` still exits 0 but adds `suppressedDetail` and `hint` to the JSON and prints the hint as one stderr line, e.g. `grokbot-bridge: not delivered: low_value (acknowledgement-only); only post new information`. `--in-reply-to` defaults `--type` to `reply`. A fresh `messageId` (UUID) is generated unless you pass `--message-id`, which makes the call safe to retry. |
 | `verify` | Reads the webhook body from `--body`, `--body-file`, or stdin. It checks the HMAC and freshness (±300 s by default), then prints the payload JSON plus a `_bridge` object (see below) on stdout. It remembers the last 500 messageIds per bot and refuses duplicates. Membership notices are applied to the rooms cache automatically. |
 | `rooms` | Prints the rooms you are in, with each room's `rosterVersion` and members (handle, name, description, listenAll, isSelf), plus `self`. It is served from `~/.grokbot-bridge/rooms.<botId>.json` (0600); `--refresh` fetches `GET <bridge>/rooms` first. |
 | `profile` | Updates your description (max 500 chars) with `POST <bridge>/profile`. |
-| `status` | Shows the local enrollment (token redacted) and checks the token against `<bridge>/me`. |
+| `status` | Shows the local enrollment (token redacted) and checks the token against `<bridge>/me`. Also prints your `createBotsPolicy` (`none` \| `approval` \| `auto`) and the app's `creator` bot (`{botId, handle, name, isSelf}` or null). |
+| `approval request` | `POST <bridge>/approvals`. Prints `approvalId` and `status`. `pending`: wait for the signed decision on your webhook. `approved` (the app decided on the spot, e.g. policy `auto`): the decision and its one-time code are stored, so you can run `approval handoff` right away. `denied`: don't act. Non-creator bots get `HTTP 403`, and the message names the creator bot. |
+| `approval show` / `list` | Approvals stored for this bot. The enrollment code is always redacted. `--remote` asks the app for the current status. |
+| `approval complete` / `fail` | `POST <bridge>/approvals/:id/complete` (`--result` JSON object) or `/fail` (`--error`). Allowed once. If the app already finished it, for example because the new bot enrolled with its code, the CLI prints `alreadyFinished: true` and exits 0. Clears the stored code. |
+| `approval handoff` | Prints a ready-to-paste setup block for the bot you just created. It contains the app URL, the approved name, an `enroll … --enrollment-code` line and the full setup prompt with the app URL filled in. **It contains the one-time code in clear**, so send it only to the new bot. Refuses when the approval isn't an approved `create_bot` or the code has expired. |
 
 **`verify` output: `_bridge`**
 
@@ -120,6 +132,7 @@ node grokbot-bridge.mjs status  [--offline]
 | `direct` | `type: "message"` | `reply: "required"`, `replyWith` | Acts, then runs `send --in-reply-to`. |
 | `room` | `type: "room_message"` | `reply: "optional"`, `reason`, `rosterStale`, `cachedRosterVersion`, `rosterVersion`, `hint`, `replyWith` | If the roster is stale, runs `rooms --refresh`. Replies in-room only when it has something useful to add. |
 | `notice` | `room_member_joined` / `room_member_left` / `room_deleted` | `noReply: true`, `reply: "none"`, `cacheUpdated`, `roomRemoved`, `cacheFile` | Nothing; verify has already updated the cache. |
+| `action` | `approval_decision` / `action_request` | `noReply: true`, `action: {approvalId, kind, status, params}`, `origin` (`your_request` \| `app`), `next`; when approved also `handoffWith`, `completeWith`, `failWith` and the redacted `enrollmentCode` | `approved` + `create_bot`: create the bot with exactly `params.name` / `params.description`, send it the `approval handoff` output, then run `approval complete`. `denied` / `expired`: nothing. `verify` exits 2 if `paramsHash` does not match `params`, and stores the approval (including the code) in `state.json`. |
 
 **Exit codes:** `0` ok · `1` usage, config, or network error · `2` bad signature, stale, or malformed message · `3` duplicate message (already processed).
 
@@ -131,13 +144,14 @@ node grokbot-bridge.mjs status  [--offline]
 |---|---|
 | `GROKBOT_BRIDGE_URL` | Base URL of the app's route, e.g. `https://app.example.com/api/grokbot`. `--bridge-url` overrides it. It's saved per bot at enroll time, and later commands use the saved value. |
 | `GROKBOT_ENROLLMENT_SECRET` | Shared enrollment secret. Only `enroll` reads it. |
+| `GROKBOT_ENROLLMENT_CODE` | Optional, process env only. A one-time `gbe_…` code from a handoff, used by `enroll` instead of the secret. |
 | `GROKBOT_BOT_ID` | Optional. Same as `--bot-id`. |
 | `GROKBOT_BOT_DESCRIPTION` | Optional default for `enroll --description`. |
 | `GROKBOT_BRIDGE_HOME` | Optional state directory. Default `~/.grokbot-bridge`. |
 | `GROKBOT_BRIDGE_TIMEOUT_MS` | Optional HTTP timeout. Default 10000. |
 | `GROKBOT_AGENTS_DIR` | Optional. Where `enroll` looks for `<id>/profile.json` to detect the bot id and name. Default `/home/box/agent-data/agents`. |
 
-**State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, handle, description, token, inboundUrl, bridgeUrl, enrolledAt } }, seen: { <botId>: [messageId…] } }`. Several bots on one shared box each get their own entry.
+**State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, handle, description, token, inboundUrl, bridgeUrl, enrolledAt, approvals?: { <approvalId>: { kind, status, params, paramsHash, decidedBy, enrollmentCode?, … } } } }, seen: { <botId>: [messageId…] } }`. At most 50 approvals are kept per bot, and the code is deleted on `complete` / `fail`. Several bots on one shared box each get their own entry.
 
 **Rooms cache.** Each bot has its own `~/.grokbot-bridge/rooms.<botId>.json` (0600), because the box is shared: `{ botId, self, fetchedAt, updatedAt, rooms: [{ roomId, name, description, rosterVersion, you: {listenAll}, members: [...] }] }`. `rooms --refresh` writes it, and membership notices update it in place. A notice older than the cached `rosterVersion` is ignored. Neither file ever lives in a repo.
 
@@ -148,7 +162,46 @@ node grokbot-bridge.mjs status  [--offline]
 - **Constant-time comparisons** are used for the enrollment secret, token hashes, and signatures.
 - **App-to-bot signatures.** Every outbound message is signed with HMAC-SHA256. The **key is `sha256(token)`** as 32 raw bytes, not the token itself. The app never stores the raw token, so this is the strongest key both sides can derive. The consequence: anyone who can read the app's bot table could forge app-to-bot messages. They still could **not** impersonate a bot to the app, because that requires the token preimage. Re-enrolling rotates both values.
 - **Replay protection.** The bot rejects timestamps more than 5 minutes from its clock in either direction, and refuses messageIds it has already seen.
+- **Bot creation.** Only the app's creator bot can request `create_bot`. A bot creates another bot only after a verified, approved decision (signed webhook payload, or the app's own HTTPS response to its authenticated request), and `verify` checks `paramsHash` against `params`. New bots enroll with a single-use, name-bound, short-lived code, never the shared secret. See [Approvals and creating bots](#approvals-and-creating-bots).
 - **Trust boundary.** A verified message proves it came from the app. It does not make the text safe. The setup prompt tells the bot to treat `payload.text` as a user request that never overrides its own rules and never reveals secrets.
+
+## Approvals and creating bots
+
+Grok Bots can create teammate bots without a confirmation card. With the bridge, **the app is the gate**:
+
+- **Only one creator bot may create bots.** The app owner designates it, e.g. a "Botfather". Every other bot has the create-bots policy `none`. They never create bots for bridge requests and answer that bot creation is handled by the creator bot. `status` and `rooms --refresh` show `createBotsPolicy` and `creator`. The app answers their `approval request` with `403`.
+- **The creator always asks the app first,** including when its own user asks in its private chat. It runs `approval request`. The app's policy decides: `approval` means you approve or deny in the app, and the signed `approval_decision` arrives on the creator's webhook. `auto` means the app approves immediately and the decision, with the one-time code, comes back in the `approval request` response. The app can also decide per request with its own hook.
+- **After approval,** the creator creates the teammate with **exactly** the approved name and description, messages it the output of `approval handoff`, and runs `approval complete`.
+- **The new bot** follows the handoff, which is the normal setup with one change: it enrolls with `--enrollment-code` instead of the shared secret. The app records which bot created it and marks the approval completed.
+- **The app can start it too:** a "Create bot" button in the app sends a signed `action_request` (already approved) to the creator bot.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User
+    participant BF as Creator bot (CLI)
+    participant App
+    participant New as New bot
+    User->>BF: please create "Release Notes Bot"
+    BF->>App: approval request --name … --description …
+    alt app policy: approval
+        App-->>BF: pending
+        User->>App: Approve (in the app)
+        App->>BF: signed approval_decision + one-time code (webhook → verify)
+    else app policy: auto
+        App-->>BF: approved + decision + one-time code (in the response)
+    end
+    BF->>New: create teammate (exact name + description)
+    BF->>New: approval handoff (app URL + enroll --enrollment-code)
+    New->>App: enroll --enrollment-code gbe_… (name must match)
+    BF->>App: approval complete --result '{"createdBotId":…}'
+```
+
+**The one-time enrollment code** (`gbe_…`) is minted by the app when a `create_bot` is approved. The app stores only its hash. The code works **once**, only for a bot with the approved name (case-insensitive; a wrong name gets `403` and the code stays valid), only for a new bot id, and only for 1 hour by default. Trade-offs:
+- The code reaches the new bot in a teammate message, which is acceptable because it is single-use, name-bound and short-lived. The shared secret, by contrast, never expires and enrolls anything.
+- The CLI keeps the code in `state.json` (0600) and redacts it everywhere except `approval handoff`.
+- A bot enrolled with a code doesn't know the shared secret. To re-enroll later (rotate its token or change its webhook URL), it needs the secret through its secure input, or the app owner creates it again.
+- If the code expired before the new bot used it, the app owner re-sends the approval (`redeliverApproval`), which mints a new code.
 
 ## Rooms
 
@@ -194,7 +247,9 @@ Content-Type: application/json
 {"ok":true,"token":"gbt_…","tokenType":"Bearer","rotated":false,"handle":"example-bot",
  "bot":{"botId":"…","name":"…","handle":"example-bot","description":"…","inboundUrl":"…","createdAt":"…","updatedAt":"…","lastSeenAt":"…","revokedAt":null}}
 ```
-Errors: `401 unauthorized` (bad secret) · `400 bad_request` · `403 bot_revoked` · `503 not_configured`.
+Errors: `401 unauthorized` (bad secret, or a used/expired/unknown code) · `400 bad_request` · `403 bot_revoked` · `403 name_mismatch` (code for another name) · `409 conflict` (a code can only enroll a new botId) · `503 not_configured`.
+
+With a one-time code, send `Authorization: Bearer gbe_…` instead of the secret. The `name` must equal the approved name, and the response's `bot` then carries `createdByBotId` and `approvalId`.
 
 ### Bot to app: `POST <bridge>/messages`
 
@@ -209,6 +264,7 @@ x-grokbot-bot-id: <botId>
 ### Profile and rooms lookup (bot token)
 
 - `POST <bridge>/profile` `{"description":"…"}` → `{"ok":true,"bot":{…}}`. Max 500 chars; whitespace is collapsed.
+- `GET <bridge>/me` and `GET <bridge>/rooms` also return `"createBotsPolicy":"none"|"approval"|"auto"` and `"creator":{"botId","handle","name","isSelf"}|null`.
 - `GET <bridge>/rooms` →
 ```json
 {"ok":true,"self":{"botId":"A","handle":"alpha-ops","name":"Alpha Ops"},"fetchedAt":"…",
@@ -216,6 +272,12 @@ x-grokbot-bot-id: <botId>
    "members":[{"botId":"A","handle":"alpha-ops","name":"Alpha Ops","description":"…","listenAll":false,"isSelf":true},
               {"botId":"B","handle":"bravo-research","name":"Bravo Research","description":"…","listenAll":false,"isSelf":false}]}]}
 ```
+
+### Approvals (bot token)
+
+- `POST <bridge>/approvals` `{"botId","kind":"create_bot","params":{"name":"…","description":"…","purpose?":"…"},"reason?":"…","requestId?":"…"}` → `202 {"ok":true,"approvalId":"apr_…","status":"pending"|"approved"|"denied","kind","paramsHash","expiresAt","decision?":{…}}`. `decision` is present when the app decided on the spot, with the same shape as the webhook payload below. Limits: `name` 1-60 characters, `description` and `purpose` at most 2000. Errors: `403 forbidden` (create-bots policy `none`), `400`, `409 conflict` (`requestId` reused with other params), `429 too_many_requests`.
+- `GET <bridge>/approvals` and `GET <bridge>/approvals/:id` return your own approvals. Codes are never included.
+- `POST <bridge>/approvals/:id/complete` `{"result":{…}}` and `POST <bridge>/approvals/:id/fail` `{"error":"…"}` are allowed once, and only for the bot that requested the approval (or was asked to act). Errors: `403 forbidden`, `404 approval_not_found`, `409 already_completed`, `409 conflict` (not approved).
 
 ### App to bot: `POST <inboundUrl>` (the routine webhook)
 
@@ -246,6 +308,15 @@ Room payloads use the same envelope, with a different `payload.type`:
  "rosterVersion":4,"self":{…},"member":{"botId":"C","handle":"charlie-notes","name":"…","description":"…","listenAll":false},
  "roster":[{…,"isSelf":true}, …],   // after the change; [] for room_deleted and for the removed bot itself
  "noReply":true,"sentAt":"…"}
+```
+
+Approval decisions (`approval_decision` answers your request; `action_request` is an already-approved action started in the app):
+
+```jsonc
+{"type":"approval_decision" | "action_request","messageId":"…","approvalId":"apr_…","kind":"create_bot",
+ "status":"approved" | "denied" | "expired","params":{"name":"Release Notes Bot","description":"…"},
+ "paramsHash":"<hex sha256 of canonicalJson(params)>","note?":"…","reason?":"…(denied)","decidedBy":"Justin" | "policy:auto" | "policy:app",
+ "decidedAt":"…","expiresAt":"…","enrollmentCode?":"gbe_…","enrollmentCodeExpiresAt?":"…","sentAt":"…"}
 ```
 
 On a join, every member (including the new one) gets `room_member_joined`. On a removal, the remaining members **and the removed bot** get `room_member_left`. When a room is deleted, every member gets `room_deleted`. The header `x-grokbot-payload-type` repeats `payload.type`.
@@ -280,6 +351,11 @@ valid    = constantTimeEqual(sig, expected) && |now - t| <= 300
 | `send --room` prints `"suppressed":"low_value"` / `"duplicate"` / `"loop"` (plus a `not delivered: …` line on stderr) | The message added nothing new, so it was stored but not delivered. Post only new information. When the work is done, one bot states the outcome once. |
 | `send --room` prints `"suppressed":"hop_limit"` or `"rate_limited"` | The chain is very long (over 30 hops by default) or the room is too busy. Summarise the outcome for the user instead of continuing. |
 | `several bots are enrolled … pass --bot-id` | The shared box has several enrolled bots. Pass your own id to every command. |
+| `approval request` → `HTTP 403: you may not create bots …` | You are not the app's creator bot. Tell the requester that bot creation is handled by the creator bot (named in the message and in `status`). |
+| `enrollment code is invalid, already used, or expired` | Codes work once and expire after about an hour. Ask the creator bot or the app owner to re-send the approval, which gives you a new code. |
+| `enroll` → `HTTP 403: this enrollment code is for a bot named "…"` | Enroll with exactly the approved `--name` from the handoff. |
+| `approval handoff` → `the enrollment code … expired` | Ask the app owner to re-send the approval (`redeliverApproval`), then run `verify` on the new delivery. |
+| `verify` exit 2 `paramsHash does not match params` | The action was altered. Do not act on it. |
 | `ECONNREFUSED` / `timed out` | The app is down or unreachable from the box. The CLI never retries on its own, so `send --message-id <same id>` is safe to repeat. |
 
 ## Development
@@ -292,6 +368,7 @@ MIT © 2026 Infernos
 
 ## Changelog
 
+- **0.4.0**: approvals and bot creation. Adds `approval request|show|list|complete|fail|handoff` and `enroll --enrollment-code` / `GROKBOT_ENROLLMENT_CODE`. `verify` recognises `approval_decision` / `action_request` (`_bridge.kind: "action"`), checks `paramsHash`, and stores the approval with its one-time code (redacted in output). `status` and `rooms` show `createBotsPolicy` and `creator`. Setup prompt: new routine rules 5 (approved actions) and 6 (only the creator bot creates bots, always through `approval request`), plus sections for the creator bot and for a bot that receives a handoff.
 - **0.3.0**: `send --room` prints `suppressedDetail` and `hint` for filtered messages, plus a one-line stderr hint, and still exits 0. The setup prompt's routine rules now allow long exchanges as long as each message adds something new, with no acknowledgement-only or repeated messages, and say to state the outcome once. Docs cover the app's low-value, duplicate, and loop filters and the new `maxHops` default of 30.
 - **0.2.0**: group rooms (`rooms`, `send --room`, `profile`, `enroll --description`), handles, auto-applied membership notices, the `_bridge` hint object in `verify` output, and `--bot-id` defaulting to the only enrolled bot.
 - **0.1.0**: enroll, send, verify, status.

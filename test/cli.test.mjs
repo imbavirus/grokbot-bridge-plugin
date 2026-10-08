@@ -242,3 +242,206 @@ test('send --room: suppressed message exits 0, prints reason + hint, one-line st
     server.close();
   }
 });
+
+// ---------------------------------------------------------------- approvals (v0.4)
+const hashParams = (params) => createHash('sha256').update(canon(params)).digest('hex');
+const CODE = 'gbe_' + randomBytes(32).toString('base64url');
+const decision = (over = {}) => {
+  const params = over.params ?? { name: 'Release Notes Bot', description: 'Writes release notes.' };
+  return {
+    type: 'approval_decision', messageId: `d-${Math.random()}`, approvalId: 'apr_0123456789abcdef', kind: 'create_bot', status: 'approved',
+    params, paramsHash: hashParams(params), decidedBy: 'Justin', decidedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 864e5).toISOString(), enrollmentCode: CODE, enrollmentCodeExpiresAt: new Date(Date.now() + 36e5).toISOString(),
+    sentAt: new Date().toISOString(), ...over,
+  };
+};
+const without = (o, ...keys) => Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+const stateOf = (env) => JSON.parse(readFileSync(join(env.GROKBOT_BRIDGE_HOME, 'state.json'), 'utf8'));
+
+test('verify: approval_decision -> kind action, code redacted in output but stored 0600; handoff prints it once', () => {
+  const env = box();
+  const r = run(['verify'], env, JSON.stringify(envelope(decision())));
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.stdout.includes(CODE), 'code never printed by verify');
+  const o = JSON.parse(r.stdout);
+  assert.match(o.enrollmentCode, /^gbe_…\(redacted, \d+ chars\)$/);
+  assert.equal(o._bridge.kind, 'action');
+  assert.equal(o._bridge.noReply, true);
+  assert.deepEqual(o._bridge.action, { approvalId: 'apr_0123456789abcdef', kind: 'create_bot', status: 'approved', params: { name: 'Release Notes Bot', description: 'Writes release notes.' } });
+  assert.match(o._bridge.completeWith, /approval complete --bot-id .* --id apr_0123456789abcdef/);
+  const st = stateOf(env);
+  assert.equal(st.bots[BOT].approvals.apr_0123456789abcdef.enrollmentCode, CODE);
+  assert.equal(statSync(join(env.GROKBOT_BRIDGE_HOME, 'state.json')).mode & 0o777, 0o600);
+  const show = run(['approval', 'show', '--id', 'apr_0123456789abcdef'], env);
+  assert.ok(!show.stdout.includes(CODE));
+  const list = run(['approval', 'list'], env);
+  assert.ok(!list.stdout.includes(CODE));
+  assert.equal(JSON.parse(list.stdout).approvals.length, 1);
+  const ho = run(['approval', 'handoff', '--id', 'apr_0123456789abcdef'], env);
+  assert.equal(ho.status, 0, ho.stderr);
+  assert.ok(ho.stdout.includes(`--enrollment-code '${CODE}'`));
+  assert.ok(ho.stdout.includes("--bridge-url 'http://127.0.0.1:1/api/grokbot'"));
+  assert.ok(ho.stdout.includes('connect "Release Notes Bot" to http://127.0.0.1:1'));
+  assert.ok(!ho.stdout.includes('<YOUR_APP_URL>'));
+  assert.match(ho.stderr, /send it only to the new bot/);
+});
+
+test('verify: paramsHash mismatch is rejected (exit 2) and nothing is stored', () => {
+  const env = box();
+  const d = decision();
+  const tampered = { ...d, params: { ...d.params, name: 'Admin Bot' } }; // re-signed, but hash is for the old params
+  const r = run(['verify'], env, JSON.stringify(envelope(tampered)));
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /paramsHash does not match params/);
+  assert.equal(stateOf(env).bots[BOT].approvals, undefined);
+});
+
+test('verify: denied/expired -> stop silently; handoff refuses; names with quotes are shell-quoted', () => {
+  const env = box();
+  const o = JSON.parse(run(['verify'], env, JSON.stringify(envelope(without(decision({ status: 'denied', reason: 'no' }), 'enrollmentCode', 'enrollmentCodeExpiresAt')))).stdout);
+  assert.match(o._bridge.next, /stop silently/);
+  assert.equal(run(['approval', 'handoff', '--id', 'apr_0123456789abcdef'], env).status, 1);
+  const env2 = box();
+  const params = { name: "O'Brien Bot", description: '' };
+  run(['verify'], env2, JSON.stringify(envelope(decision({ params, approvalId: 'apr_quotes00000000' }))));
+  const ho = run(['approval', 'handoff', '--id', 'apr_quotes00000000'], env2);
+  assert.ok(ho.stdout.includes(`--name 'O'\\''Brien Bot'`), ho.stdout);
+  // expired code -> handoff refuses
+  const env3 = box();
+  run(['verify'], env3, JSON.stringify(envelope(decision({ approvalId: 'apr_expired0000000', enrollmentCodeExpiresAt: new Date(Date.now() - 1000).toISOString() }))));
+  const ex = run(['approval', 'handoff', '--id', 'apr_expired0000000'], env3);
+  assert.equal(ex.status, 1);
+  assert.match(ex.stderr, /expired/);
+});
+
+test('approval request/complete/fail and enroll --enrollment-code talk to the app correctly', async () => {
+  const seen = [];
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    seen.push({ url: req.url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
+    res.setHeader('content-type', 'application/json');
+    if (req.url.endsWith('/approvals')) return res.writeHead(202).end(JSON.stringify({ ok: true, approvalId: 'apr_fromserver000000', status: 'pending', expiresAt: 'later' }));
+    if (req.url.endsWith('/complete')) {
+      if (seen.filter((s) => s.url.endsWith('/complete')).length > 1) return res.writeHead(409).end(JSON.stringify({ ok: false, error: { code: 'already_completed', message: 'approval apr_0123456789abcdef is already completed' } }));
+      return res.end(JSON.stringify({ ok: true, approval: { status: 'completed', completedAt: 'now' } }));
+    }
+    if (req.url.endsWith('/fail')) return res.end(JSON.stringify({ ok: true, approval: { status: 'failed' } }));
+    if (req.url.endsWith('/enroll')) {
+      if (req.headers.authorization !== `Bearer ${CODE}`) return res.writeHead(401).end(JSON.stringify({ ok: false, error: { code: 'unauthorized', message: 'invalid, used or expired enrollment code' } }));
+      return res.writeHead(201).end(JSON.stringify({ ok: true, token: 'gbt_' + 'n'.repeat(43), handle: 'release-notes-bot', bot: { name: 'Release Notes Bot', handle: 'release-notes-bot', createdByBotId: BOT, approvalId: 'apr_0123456789abcdef' } }));
+    }
+    res.writeHead(404).end('{}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/api/grokbot`;
+  const env = box();
+  const st0 = stateOf(env); st0.bots[BOT].bridgeUrl = url; writeFileSync(join(env.GROKBOT_BRIDGE_HOME, 'state.json'), JSON.stringify(st0), { mode: 0o600 });
+  const runA = (args, e = env) => new Promise((resolve) => {
+    const c = execFile(process.execPath, [CLI, ...args], { env: e, timeout: 20000 }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
+    c.stdin.end('');
+  });
+  try {
+    const rq = await runA(['approval', 'request', '--kind', 'create_bot', '--name', 'Release  Notes Bot', '--description', 'Writes release notes.', '--reason', 'asked in room']);
+    assert.equal(rq.code, 0, rq.stderr);
+    assert.equal(JSON.parse(rq.stdout).approvalId, 'apr_fromserver000000');
+    assert.equal(seen[0].auth, `Bearer ${token}`);
+    assert.deepEqual(seen[0].body.params, { name: 'Release Notes Bot', description: 'Writes release notes.' });
+    assert.equal(seen[0].body.kind, 'create_bot');
+    assert.equal(seen[0].body.reason, 'asked in room');
+    assert.match(seen[0].body.requestId, /^[0-9a-f-]{36}$/);
+    assert.equal(stateOf(env).bots[BOT].approvals.apr_fromserver000000.status, 'pending');
+    assert.equal((await runA(['approval', 'request', '--name', 'x'.repeat(61)])).code, 1);
+    assert.equal((await runA(['approval', 'request', '--kind', 'deploy'])).code, 1); // needs --params
+    // complete: stores status, drops the code; second time -> 409 already_completed -> exit 0
+    run(['verify'], env, JSON.stringify(envelope(decision())));
+    const c1 = await runA(['approval', 'complete', '--id', 'apr_0123456789abcdef', '--result', '{"createdBotId":"n1","createdBotName":"Release Notes Bot"}']);
+    assert.equal(c1.code, 0, c1.stderr);
+    assert.deepEqual(seen.at(-1).body.result, { createdBotId: 'n1', createdBotName: 'Release Notes Bot' });
+    const st = stateOf(env).bots[BOT].approvals.apr_0123456789abcdef;
+    assert.equal(st.status, 'completed');
+    assert.equal(st.enrollmentCode, undefined);
+    const c2 = await runA(['approval', 'complete', '--id', 'apr_0123456789abcdef']);
+    assert.equal(c2.code, 0);
+    assert.equal(JSON.parse(c2.stdout).alreadyFinished, true);
+    assert.equal((await runA(['approval', 'complete', '--id', 'apr_0123456789abcdef', '--result', 'not json'])).code, 1);
+    const f = await runA(['approval', 'fail', '--id', 'apr_0123456789abcdef', '--error', 'quota']);
+    assert.equal(f.code, 0);
+    assert.equal(seen.at(-1).body.error, 'quota');
+    assert.equal((await runA(['approval', 'fail', '--id', 'apr_0123456789abcdef'])).code, 1); // --error required
+    // enroll with a code: Bearer <code>, no secret needed; bad code -> friendly one-liner
+    const nb = { ...box(), GROKBOT_ENROLLMENT_SECRET: '' };
+    const en = await runA(['enroll', '--bot-id', BOT2, '--name', 'Release Notes Bot', '--bridge-url', url, '--inbound-url', 'https://x.test/h', '--enrollment-code', CODE], nb);
+    assert.equal(en.code, 0, en.stderr);
+    assert.equal(seen.at(-1).auth, `Bearer ${CODE}`);
+    assert.deepEqual(JSON.parse(en.stdout).enrolledWith, 'enrollment_code');
+    assert.ok(!en.stdout.includes(CODE));
+    const bad = await runA(['enroll', '--bot-id', BOT2, '--name', 'Release Notes Bot', '--bridge-url', url, '--inbound-url', 'https://x.test/h'], { ...nb, GROKBOT_ENROLLMENT_CODE: 'gbe_' + 'z'.repeat(43) });
+    assert.equal(bad.code, 1);
+    assert.match(bad.stderr, /cannot be reused/);
+    assert.equal(bad.stderr.trim().split('\n').length, 1);
+    assert.equal((await runA(['enroll', '--inbound-url', 'https://x.test/h', '--enrollment-code', 'secret-not-code'], nb)).code, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('creator bot: sync approved/denied decisions from approval request; status shows createBotsPolicy + creator; none -> 403', async () => {
+  let mode = 'auto';
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    res.setHeader('content-type', 'application/json');
+    if (req.url.endsWith('/me')) return res.end(JSON.stringify({ ok: true, bot: { botId: BOT }, createBotsPolicy: 'auto', creator: { botId: BOT, handle: 'botfather', name: 'Botfather', isSelf: true } }));
+    if (req.url.endsWith('/approvals')) {
+      const { params } = JSON.parse(body);
+      if (mode === 'none') return res.writeHead(403).end(JSON.stringify({ ok: false, error: { code: 'forbidden', message: 'you may not create bots (create-bots policy: none); bot creation in this app is handled by the creator bot @botfather (Botfather)' } }));
+      const tamper = mode === 'tamper';
+      const status = mode === 'deny' ? 'denied' : 'approved';
+      const d = decision({ approvalId: 'apr_sync0000000000', status, params: tamper ? { ...params, name: 'Other' } : params, decidedBy: 'policy:auto', ...(status === 'denied' ? { reason: 'denied by app policy' } : {}) });
+      if (status === 'denied') { delete d.enrollmentCode; delete d.enrollmentCodeExpiresAt; }
+      return res.writeHead(202).end(JSON.stringify({ ok: true, approvalId: 'apr_sync0000000000', status, decidedByPolicy: 'policy:auto', decision: d }));
+    }
+    res.writeHead(404).end('{}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/api/grokbot`;
+  const mk = () => { const e = box(); const st = stateOf(e); st.bots[BOT].bridgeUrl = url; writeFileSync(join(e.GROKBOT_BRIDGE_HOME, 'state.json'), JSON.stringify(st), { mode: 0o600 }); return e; };
+  const runA = (args, e) => new Promise((resolve) => {
+    const c = execFile(process.execPath, [CLI, ...args], { env: e, timeout: 20000 }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
+    c.stdin.end('');
+  });
+  const req = ['approval', 'request', '--name', 'Release Notes Bot', '--description', 'Writes release notes.'];
+  try {
+    const env = mk();
+    const st = JSON.parse((await runA(['status'], env)).stdout);
+    assert.equal(st.createBotsPolicy, 'auto');
+    assert.equal(st.creator.handle, 'botfather');
+    const r = await runA(req, env);
+    assert.equal(r.code, 0, r.stderr);
+    const o = JSON.parse(r.stdout);
+    assert.equal(o.status, 'approved');
+    assert.equal(o.autoApproved, true);
+    assert.match(o.handoffWith, /approval handoff --bot-id .* --id apr_sync0000000000/);
+    assert.ok(!r.stdout.includes(CODE), 'code redacted in request output');
+    assert.equal(stateOf(env).bots[BOT].approvals.apr_sync0000000000.enrollmentCode, CODE);
+    const ho = await runA(['approval', 'handoff', '--id', 'apr_sync0000000000'], env);
+    assert.equal(ho.code, 0, ho.stderr);
+    assert.ok(ho.stdout.includes(`--enrollment-code '${CODE}'`), 'handoff right after request, no waiting');
+    mode = 'deny';
+    const env2 = mk();
+    const dn = JSON.parse((await runA(req, env2)).stdout);
+    assert.equal(dn.status, 'denied');
+    assert.match(dn.next, /do not create it/);
+    assert.equal(stateOf(env2).bots[BOT].approvals.apr_sync0000000000.enrollmentCode, undefined);
+    mode = 'tamper';
+    const tp = await runA(req, mk());
+    assert.equal(tp.code, 2);
+    mode = 'none';
+    const nn = await runA(req, mk());
+    assert.equal(nn.code, 1);
+    assert.match(nn.stderr, /HTTP 403: .*handled by the creator bot @botfather/);
+  } finally {
+    server.close();
+  }
+});
