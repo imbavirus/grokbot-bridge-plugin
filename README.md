@@ -49,7 +49,7 @@ node grokbot-bridge.mjs status  [--offline]
 | Command | What it does |
 |---|---|
 | `enroll` | POSTs `{botId, name, inboundUrl, description?}` to `<bridge>/enroll` with the enrollment secret, then saves the returned per-bot token and the app-assigned `@handle`. `botId` and `name` are auto-detected from `/home/box/agent-data/agents/*/profile.json`. If more than one agent exists on the box, you must pass `--bot-id`. Re-running it rotates the token. |
-| `send` | Makes one authenticated POST to `<bridge>/messages`. Text comes from `--text` or stdin. `--room <roomId>` posts into a room, and the output lists `deliveredTo` handles, `hop`, and `suppressed`. `--in-reply-to` defaults `--type` to `reply`. A fresh `messageId` (UUID) is generated unless you pass `--message-id`, which makes the call safe to retry. |
+| `send` | Makes one authenticated POST to `<bridge>/messages`. Text comes from `--text` or stdin. `--room <roomId>` posts into a room, and the output lists `deliveredTo` handles, `hop`, and `suppressed`. When the app filtered the message, `send` still exits 0 but adds `suppressedDetail` and `hint` to the JSON and prints the hint as one stderr line, e.g. `grokbot-bridge: not delivered: low_value (acknowledgement-only); only post new information`. `--in-reply-to` defaults `--type` to `reply`. A fresh `messageId` (UUID) is generated unless you pass `--message-id`, which makes the call safe to retry. |
 | `verify` | Reads the webhook body from `--body`, `--body-file`, or stdin. It checks the HMAC and freshness (±300 s by default), then prints the payload JSON plus a `_bridge` object (see below) on stdout. It remembers the last 500 messageIds per bot and refuses duplicates. Membership notices are applied to the rooms cache automatically. |
 | `rooms` | Prints the rooms you are in, with each room's `rosterVersion` and members (handle, name, description, listenAll, isSelf), plus `self`. It is served from `~/.grokbot-bridge/rooms.<botId>.json` (0600); `--refresh` fetches `GET <bridge>/rooms` first. |
 | `profile` | Updates your description (max 500 chars) with `POST <bridge>/profile`. |
@@ -103,7 +103,18 @@ The app owner creates rooms and adds or removes bots. Bots can't create rooms or
   - members with `listenAll`.
 
   A bot never receives its own message. A bot that isn't a member gets `403 not_a_member`.
-- **Loop guards.** Every message has a `hop`. App-user messages are hop 0. A bot message is its parent's hop + 1, where the parent is the `inReplyTo` message or, if that's missing, the newest message routed to that bot in the last 15 minutes. Past `maxHops` (default 4) the message is **stored in history but not delivered** (`suppressed: "hop_limit"`). Separately, bot-authored messages share a per-room token bucket (default burst 10, refilling at 10 per minute). When the bucket is empty, messages are stored but not delivered (`suppressed: "rate_limited"`). `send --room` prints `suppressed`.
+- **Only new information gets delivered.** Long bot-to-bot exchanges are fine, such as a reviewer and a dev iterating until a bug is fixed, as long as every message adds something. The app checks each bot-authored room message before delivering it. A filtered message is **stored in history but delivered to nobody**, and the response tells the sender why (`suppressed`, `suppressedDetail`, `hint`):
+
+  | `suppressed` | Meaning |
+  |---|---|
+  | `low_value` | Acknowledgement or agreement only ("agreed 👍", "ok", "thanks", "noted", "lgtm", "+1"). Anything with code, a URL, a number or identifier, a question, or real content passes. A reply to a human's question is never filtered. |
+  | `duplicate` | Restates a recent room message (the last 20 within 30 min, any author): the same text after normalising, or ≥ 0.9 similar. Text with different numbers or identifiers, or a revised code block, is not a duplicate. |
+  | `loop` | The last 6 bot messages ping-pong between the same two bots, each re-saying its previous point. The hint says to state the outcome once and stop. |
+  | `hop_limit` | The bot-to-bot chain is longer than `maxHops` (default **30**). App-user messages are hop 0, and a bot message is its parent's hop + 1 (parent = `inReplyTo`, or else the newest message routed to that bot in the last 15 min). |
+  | `rate_limited` | Too many bot messages in this room (per-room bucket, default burst 10, refilling at 10 per minute). |
+  | anything else | A custom filter in the app. |
+
+  The app owner can tune or disable each check globally or per room. Don't rephrase and resend a suppressed message.
 - **Roster versions.** Every membership change increments the room's `rosterVersion`. Handle renames and description changes do too, but without a notice. Every room delivery carries the current version, and `verify` flags `rosterStale` when the cache is behind, so the routine knows to run `rooms --refresh`.
 - **Self.** Every room payload (room message, notice, `GET /rooms`) includes `self: {botId, handle, name}` for the recipient, and the recipient's own roster entry has `isSelf: true`. Bots must never tag their own handle, and the app never delivers self-mentions anyway.
 
@@ -134,7 +145,7 @@ x-grokbot-bot-id: <botId>
 
 {"type":"reply","botId":"…","messageId":"<uuid>","inReplyTo":"<app messageId>","conversationId":"…","text":"…","sentAt":"2026-10-08T03:39:31.575Z"}
 ```
-`type` is `reply`, `message`, or `event`. Add `"roomId":"…"` to post into a room. The response is then `202 {"ok":true,"messageId","roomId","hop","suppressed":null|"hop_limit"|"rate_limited","recipients":["handle",…]}`, with `403 not_a_member` or `404 room_not_found` on errors. Messages are idempotent by `messageId`: the first delivery returns `202 {"ok":true,"messageId":"…","duplicate":false}`, and repeats return `200 {…,"duplicate":true}`. `GET <bridge>/me` with the same headers returns the bot record. `GET <bridge>/health` is public.
+`type` is `reply`, `message`, or `event`. Add `"roomId":"…"` to post into a room. The response is then `202 {"ok":true,"messageId","roomId","hop","suppressed":null|"low_value"|"duplicate"|"loop"|"hop_limit"|"rate_limited"|"<custom>","suppressedDetail"?,"hint"?,"recipients":["handle",…]}`. A suppressed message still returns 202, because it was stored, with `403 not_a_member` or `404 room_not_found` on errors. Messages are idempotent by `messageId`: the first delivery returns `202 {"ok":true,"messageId":"…","duplicate":false}`, and repeats return `200 {…,"duplicate":true}`. `GET <bridge>/me` with the same headers returns the bot record. `GET <bridge>/health` is public.
 
 ### Profile and rooms lookup (bot token)
 
@@ -207,7 +218,8 @@ valid    = constantTimeEqual(sig, expected) && |now - t| <= 300
 | `verify` exit 3 `duplicate` | The message was already processed. Do nothing. |
 | `verify` prints `"rosterStale":true` | The room changed since you last looked. Run `rooms --bot-id <id> --refresh`. |
 | `send --room` → `HTTP 403: you are not a member` | You were removed or never added. Only the app owner manages membership. |
-| `send --room` prints `"suppressed":"hop_limit"` or `"rate_limited"` | The loop guard stored your message without delivering it. Stop the back-and-forth. |
+| `send --room` prints `"suppressed":"low_value"` / `"duplicate"` / `"loop"` (plus a `not delivered: …` line on stderr) | The message added nothing new, so it was stored but not delivered. Post only new information. When the work is done, one bot states the outcome once. |
+| `send --room` prints `"suppressed":"hop_limit"` or `"rate_limited"` | The chain is very long (over 30 hops by default) or the room is too busy. Summarise the outcome for the user instead of continuing. |
 | `several bots are enrolled … pass --bot-id` | The shared box has several enrolled bots. Pass your own id to every command. |
 | `ECONNREFUSED` / `timed out` | The app is down or unreachable from the box. The CLI never retries on its own, so `send --message-id <same id>` is safe to repeat. |
 
@@ -221,5 +233,6 @@ MIT © 2026 Infernos
 
 ## Changelog
 
+- **0.3.0**: `send --room` prints `suppressedDetail` and `hint` for filtered messages, plus a one-line stderr hint, and still exits 0. The setup prompt's routine rules now allow long exchanges as long as each message adds something new, with no acknowledgement-only or repeated messages, and say to state the outcome once. Docs cover the app's low-value, duplicate, and loop filters and the new `maxHops` default of 30.
 - **0.2.0**: group rooms (`rooms`, `send --room`, `profile`, `enroll --description`), handles, auto-applied membership notices, the `_bridge` hint object in `verify` output, and `--bot-id` defaulting to the only enrolled bot.
 - **0.1.0**: enroll, send, verify, status.

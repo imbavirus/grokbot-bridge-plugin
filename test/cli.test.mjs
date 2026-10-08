@@ -204,3 +204,41 @@ test('rooms --refresh fetches with the bot token, caches per botId; profile upda
     server.close();
   }
 });
+
+test('send --room: suppressed message exits 0, prints reason + hint, one-line stderr hint; delivered one is quiet', async () => {
+  const replies = [
+    { ok: true, messageId: 'x1', roomId: 'room_1', duplicate: false, hop: 3, suppressed: 'low_value', suppressedDetail: 'acknowledgement-only', hint: 'not delivered: low_value (acknowledgement-only); only post new information', recipients: [] },
+    { ok: true, messageId: 'x2', roomId: 'room_1', duplicate: false, hop: 4, suppressed: 'duplicate', suppressedDetail: 'repeats m-1 by @bravo', recipients: [] }, // older server: no hint
+    { ok: true, messageId: 'x3', roomId: 'room_1', duplicate: false, hop: 4, suppressed: null, recipients: ['bravo'] },
+  ];
+  const server = createServer(async (req, res) => {
+    for await (const _ of req);
+    res.setHeader('content-type', 'application/json');
+    res.writeHead(202).end(JSON.stringify(replies.shift()));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const env = box();
+  const url = `http://127.0.0.1:${server.address().port}/api/grokbot`;
+  const send = (text) => new Promise((resolve) => {
+    execFile(process.execPath, [CLI, 'send', '--bridge-url', url, '--room', 'room_1', '--text', text], { env, timeout: 20000 }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
+  });
+  try {
+    const a = await send('agreed!');
+    assert.equal(a.code, 0, a.stderr);
+    const ja = JSON.parse(a.stdout);
+    assert.equal(ja.suppressed, 'low_value');
+    assert.equal(ja.suppressedDetail, 'acknowledgement-only');
+    assert.deepEqual(ja.deliveredTo, []);
+    assert.equal(a.stderr, 'grokbot-bridge: not delivered: low_value (acknowledgement-only); only post new information\n');
+    const b = await send('the fix is in the parser');
+    assert.equal(b.code, 0);
+    assert.equal(JSON.parse(b.stdout).hint, 'not delivered: duplicate (repeats a recent message); only post new information');
+    assert.match(b.stderr, /^grokbot-bridge: not delivered: duplicate/);
+    const c = await send('new finding: line 42');
+    assert.equal(c.code, 0);
+    assert.deepEqual(JSON.parse(c.stdout), { ok: true, messageId: 'x3', roomId: 'room_1', duplicate: false, hop: 4, suppressed: null, deliveredTo: ['@bravo'] });
+    assert.equal(c.stderr, '');
+  } finally {
+    server.close();
+  }
+});

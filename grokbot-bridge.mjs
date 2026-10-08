@@ -19,7 +19,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
@@ -35,6 +35,17 @@ watchdog.unref();
 class CliError extends Error {
   constructor(code, message) { super(message); this.exitCode = code; }
 }
+function note(message) {
+  // eslint-disable-next-line no-control-regex
+  process.stderr.write(`grokbot-bridge: ${String(message).replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()}\n`);
+}
+const SUPPRESS_HINTS = {
+  low_value: 'not delivered: low_value (acknowledgement-only); only post new information',
+  duplicate: 'not delivered: duplicate (repeats a recent message); only post new information',
+  loop: 'not delivered: loop (ping-pong without new information); state the outcome once and stop',
+  hop_limit: 'not delivered: hop_limit (bot-to-bot chain too long); summarise the outcome for the user instead',
+  rate_limited: 'not delivered: rate_limited (too many bot messages in this room); slow down and only post new information',
+};
 function fail(code, message) {
   process.stderr.write(`grokbot-bridge: ${String(message).replace(/\s+/g, ' ').trim()}\n`);
   process.exit(code);
@@ -321,7 +332,16 @@ async function cmdSend(args) {
     body,
   });
   if (args.room) {
-    out({ ok: true, messageId: res.messageId || body.messageId, roomId: args.room, duplicate: !!res.duplicate, hop: res.hop, suppressed: res.suppressed ?? null, deliveredTo: (res.recipients || []).map((h) => `@${h}`) });
+    const suppressed = typeof res.suppressed === 'string' ? res.suppressed : null;
+    const hint = suppressed ? (typeof res.hint === 'string' && res.hint) || SUPPRESS_HINTS[suppressed] || `not delivered: ${suppressed}` : undefined;
+    out({
+      ok: true, messageId: res.messageId || body.messageId, roomId: args.room, duplicate: !!res.duplicate, hop: res.hop,
+      suppressed,
+      ...(suppressed && res.suppressedDetail ? { suppressedDetail: String(res.suppressedDetail) } : {}),
+      ...(hint ? { hint } : {}),
+      deliveredTo: (res.recipients || []).map((h) => `@${h}`),
+    });
+    if (hint) note(hint); // exit 0: the app accepted and stored it, it just did not wake anyone
   } else {
     out({ ok: true, messageId: res.messageId || body.messageId, duplicate: !!res.duplicate });
   }
