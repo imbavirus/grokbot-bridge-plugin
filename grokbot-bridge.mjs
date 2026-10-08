@@ -8,6 +8,8 @@
 //   node grokbot-bridge.mjs rooms   [--refresh]
 //   node grokbot-bridge.mjs profile --description <text>
 //   node grokbot-bridge.mjs approval request|show|list|complete|fail|handoff ...
+//   node grokbot-bridge.mjs soul pull|show|applied ...
+//   node grokbot-bridge.mjs memory status|search|store|read ...
 //   node grokbot-bridge.mjs status
 //
 // --bot-id defaults to the only bot enrolled in state.json.
@@ -15,12 +17,12 @@
 // message, 3 duplicate message (already processed).
 
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
@@ -33,6 +35,11 @@ const CODE_RE = /^gbe_[A-Za-z0-9_-]{20,200}$/;
 const APPROVALS_PER_BOT = 50;
 const CREATE_BOT_NAME_MAX = 60;
 const CREATE_BOT_TEXT_MAX = 2000;
+const CREATE_BOT_SOUL_MAX = 10_000;
+const SOUL_VERSION_RE = /^[0-9a-f]{16,64}$/;
+const MEMORY_KIND_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+const MEMORY_TEXT_MAX = 20_000;
+const MEMORY_QUERY_MAX = 2000;
 
 // Never hang: hard watchdog for the whole process.
 const watchdog = setTimeout(() => fail(1, `timed out after ${HARD_DEADLINE_MS}ms`), HARD_DEADLINE_MS);
@@ -58,7 +65,7 @@ function fail(code, message) {
 }
 
 // ---------- args / env ----------
-const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote']);
+const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote', 'append']);
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -321,14 +328,30 @@ async function cmdEnroll(args) {
   const prev = state.bots[botId];
   state.bots[botId] = {
     ...(prev?.approvals ? { approvals: prev.approvals } : {}),
+    ...(prev?.soul ? { soul: prev.soul } : {}),
+    ...(res.memorySource ? { memorySource: res.memorySource } : prev?.memorySource ? { memorySource: prev.memorySource } : {}),
     botId, name: res.bot?.name || name, handle: res.handle || res.bot?.handle, description: res.bot?.description ?? description ?? '',
     token: res.token, inboundUrl: res.bot?.inboundUrl || inboundUrl, bridgeUrl, enrolledAt: res.bot?.updatedAt || new Date().toISOString(),
   };
   saveState(state);
   const b = state.bots[botId];
+  // v0.5: the app may hold a soul (persona) for this bot. Fetch it now so the bot can adopt it right away.
+  let soul;
+  if (res.soul && typeof res.soul === 'object') {
+    try {
+      const pulled = await pullSoul(state, b, args);
+      soul = summariseSoul(pulled, botId);
+    } catch (e) {
+      soul = { version: res.soul.version ?? null, error: e.message, next: `run: ${CLI_CMD} soul pull --bot-id ${botId}` };
+    }
+  } else if ('soul' in res) {
+    soul = null;
+  }
   out({
     ok: true, botId, name: b.name, handle: b.handle ? `@${b.handle}` : null, description: b.description, inboundUrl: b.inboundUrl, bridgeUrl, rotated: !!res.rotated,
     ...(code ? { enrolledWith: 'enrollment_code', createdByBotId: res.bot?.createdByBotId ?? null, approvalId: res.bot?.approvalId ?? null } : {}),
+    ...(soul !== undefined ? { soul } : {}),
+    ...(res.memorySource ? { memorySource: res.memorySource, memoryNext: memoryNext(res.memorySource, botId) } : {}),
     stateFile: STATE_FILE,
   });
 }
@@ -415,17 +438,55 @@ async function cmdVerify(args) {
     dirty = true;
   }
   if (isAction) { storeAction(state.bots[bot.botId], payload); dirty = true; }
+  if (payload.type === 'memory_source_updated' && payload.memorySource && typeof payload.memorySource === 'object') {
+    state.bots[bot.botId].memorySource = { kind: String(payload.memorySource.kind || 'none'), sharedRead: payload.memorySource.sharedRead === true };
+    dirty = true;
+  }
   if (dirty) saveState(state);
   const shown = isAction && payload.enrollmentCode ? { ...payload, enrollmentCode: redactCode(payload.enrollmentCode) } : payload;
-  process.stdout.write(JSON.stringify({ ...shown, _bridge: classify(bot.botId, payload) }) + '\n');
+  const _bridge = classify(bot.botId, payload, state.bots[bot.botId]);
+  process.stdout.write(JSON.stringify({ ...shown, _bridge }) + '\n');
 }
 
 const NOTICE_TYPES = new Set(['room_member_joined', 'room_member_left', 'room_deleted']);
 const ACTION_TYPES = new Set(['approval_decision', 'action_request']);
+const CONFIG_TYPES = new Set(['soul_updated', 'memory_source_updated']);
 const CLI_CMD = 'node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs';
 
 // Tell the routine what to do with a verified payload, and keep the rooms cache in sync.
-function classify(botId, p) {
+function classify(botId, p, bot) {
+  if (CONFIG_TYPES.has(p.type)) return classifyConfig(botId, p, bot);
+  const base = classifyTask(botId, p);
+  // v0.5: task envelopes carry the bot's current soulVersion; compare with the version this bot last applied.
+  if (p.soulVersion !== undefined && base.kind !== 'notice') {
+    const applied = appliedSoulVersion(bot);
+    if ((p.soulVersion ?? null) !== applied) {
+      base.soul = {
+        stale: true, version: p.soulVersion ?? null, applied,
+        next: `before acting: run ${CLI_CMD} soul pull --bot-id ${botId}, adopt the result as your persona (rule 8), run its appliedWith command, then handle this message`,
+      };
+    }
+  }
+  return base;
+}
+
+function classifyConfig(botId, p, bot) {
+  const base = { kind: 'config', noReply: true, reply: 'none' };
+  if (p.type === 'soul_updated') {
+    const applied = appliedSoulVersion(bot);
+    const version = p.soulVersion ?? null;
+    return {
+      ...base, change: 'soul', version, applied, soulStale: version !== applied, updatedBy: p.updatedBy ?? null,
+      next: version === applied
+        ? 'your soul is already up to date: do nothing, stop silently'
+        : `my owner changed your soul in my app: run ${CLI_CMD} soul pull --bot-id ${botId}, adopt it as your persona (rule 8), run its appliedWith command; do not reply`,
+    };
+  }
+  const src = { kind: String(p.memorySource?.kind || 'none'), sharedRead: p.memorySource?.sharedRead === true };
+  return { ...base, change: 'memory_source', memorySource: src, next: memoryNext(src, botId) + '; do not reply' };
+}
+
+function classifyTask(botId, p) {
   if (NOTICE_TYPES.has(p.type)) {
     const applied = applyNotice(botId, p);
     return { kind: 'notice', noReply: true, reply: 'none', ...applied, cacheFile: roomsFile(botId), note: 'membership notice applied to the local rooms cache; do not reply' };
@@ -554,7 +615,15 @@ async function approvalRequest(args, state, bot) {
     const description = String(args.description ?? '');
     if (description.length > CREATE_BOT_TEXT_MAX) throw new CliError(1, `--description too long (max ${CREATE_BOT_TEXT_MAX} chars)`);
     if (args.purpose !== undefined && String(args.purpose).length > CREATE_BOT_TEXT_MAX) throw new CliError(1, `--purpose too long (max ${CREATE_BOT_TEXT_MAX} chars)`);
-    params = { name, description, ...(args.purpose ? { purpose: String(args.purpose) } : {}) };
+    let soul = args.soul;
+    if (soul === undefined && args['soul-file']) {
+      try { soul = readFileSync(args['soul-file'], 'utf8'); } catch (e) { throw new CliError(1, `cannot read --soul-file: ${e.message}`); }
+    }
+    if (soul !== undefined) {
+      soul = String(soul).replace(/\r\n?/g, '\n').trim();
+      if (soul.length > CREATE_BOT_SOUL_MAX) throw new CliError(1, `--soul too long (max ${CREATE_BOT_SOUL_MAX} chars)`);
+    }
+    params = { name, description, ...(args.purpose ? { purpose: String(args.purpose) } : {}), ...(soul ? { soul } : {}) };
   } else throw new CliError(1, `approval request --kind ${kind} needs --params '<json object>'`);
   const requestId = args['request-id'] || randomUUID();
   if (!ID_RE.test(requestId)) throw new CliError(1, 'invalid --request-id');
@@ -664,6 +733,7 @@ function approvalHandoff(args, state, bot) {
     `- In step 7, enroll with this command instead (fill in <BOT_ID>, <routine webhook URL> and <DESCRIPTION> as the steps describe; keep the name exactly as shown):`,
     `  ${enrollLine}`,
     `- If enroll says the code is invalid, used or expired, stop and say so. A code cannot be reused.`,
+    ...soulHandoffLines(a, bridgeUrl),
     '',
     prompt ? '--- setup prompt ---' : `--- setup prompt: fetch it with: curl -fsSL https://raw.githubusercontent.com/imbavirus/grokbot-bridge-plugin/main/SETUP_PROMPT.md (use the text below its --- line; replace <YOUR_APP_URL> with ${appUrl}) ---`,
     ...(prompt ? [fill(prompt)] : []),
@@ -672,6 +742,22 @@ function approvalHandoff(args, state, bot) {
   if (args.json) return out({ ok: true, approvalId: id, name, appUrl, bridgeUrl, enrollmentCodeExpiresAt: a.enrollmentCodeExpiresAt ?? null, text });
   process.stdout.write(text + '\n');
   note('the handoff contains the one-time enrollment code: send it only to the new bot');
+}
+
+// What the creator tells the new bot about its soul: the approved text (if any) and where to fetch it from from now on.
+function soulHandoffLines(a, bridgeUrl) {
+  const soul = typeof a.params?.soul === 'string' ? a.params.soul.trim() : '';
+  const where = `the app's soul endpoint (GET ${bridgeUrl}/soul, which \`${CLI_CMD} soul pull --bot-id <BOT_ID>\` calls with your own token)`;
+  if (!soul) {
+    return [`- Your soul (persona): none was set when you were created. My owner may set one in the app later; it is served by ${where}. You will get a signed soul_updated notice when it changes, and you adopt it then (routine rule 8).`];
+  }
+  return [
+    `- Your soul (persona), as approved by my owner in the app (version ${soulVersionOf(soul)}):`,
+    '  <<<SOUL',
+    ...soul.split('\n').map((l) => `  ${l}`),
+    '  SOUL>>>',
+    `- The app is the source of truth for your soul: after enrolling, \`enroll\` fetches it from ${where}. Adopt THAT copy as your persona (setup step 8 and routine rule 8), then run the \`appliedWith\` command it prints. Fetch it again whenever the app says it changed (soul_updated notice, or \`_bridge.soul.stale\` on a message).`,
+  ];
 }
 
 async function cmdApproval(args) {
@@ -688,6 +774,163 @@ async function cmdApproval(args) {
   return subs[sub](args, state, bot);
 }
 
+// ---------- soul (v0.5) ----------
+function soulFile(botId) { return join(HOME_DIR, `soul.${botId}.md`); }
+function soulVersionOf(text) { return createHash('sha256').update(text, 'utf8').digest('hex').slice(0, 16); }
+function appliedSoulVersion(bot) { return bot?.soul && 'appliedVersion' in bot.soul ? bot.soul.appliedVersion ?? null : null; }
+
+async function pullSoul(state, bot, args) {
+  const res = await http('GET', `${bridgeUrlFrom(args, bot)}/soul`, { headers: botHeaders(bot) });
+  if (!('soul' in res)) throw new CliError(1, 'soul response did not include soul (is the app on grokbot-bridge-next 0.5+?)');
+  const s = res.soul;
+  const prev = state.bots[bot.botId].soul || {};
+  const fetchedAt = new Date().toISOString();
+  if (s === null) {
+    rmSync(soulFile(bot.botId), { force: true });
+    state.bots[bot.botId].soul = { ...prev, version: null, updatedAt: null, updatedBy: null, fetchedAt };
+  } else {
+    if (!s || typeof s.text !== 'string' || typeof s.version !== 'string' || !SOUL_VERSION_RE.test(s.version)) throw new CliError(1, 'malformed soul response');
+    // soulVersion = leading hex of sha256(text): a cheap integrity check of what we are about to adopt.
+    if (!createHash('sha256').update(s.text, 'utf8').digest('hex').startsWith(s.version.toLowerCase())) {
+      throw new CliError(2, 'soul text does not match its version (corrupted in transit); do not adopt it');
+    }
+    writeSecureText(soulFile(bot.botId), s.text.endsWith('\n') ? s.text : `${s.text}\n`);
+    state.bots[bot.botId].soul = { ...prev, version: s.version, updatedAt: s.updatedAt ?? null, updatedBy: s.updatedBy ?? null, fetchedAt };
+  }
+  if (res.memorySource && typeof res.memorySource === 'object') state.bots[bot.botId].memorySource = res.memorySource;
+  saveState(state);
+  return { soul: s, changed: (prev.version ?? null) !== (s?.version ?? null), applied: appliedSoulVersion(state.bots[bot.botId]), memorySource: res.memorySource ?? null };
+}
+
+function writeSecureText(file, text) {
+  mkdirSync(HOME_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, text, { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, file);
+}
+
+function soulNext(version, applied, botId) {
+  if (version === null) {
+    return applied === null
+      ? 'no soul is set for you in this app: nothing to do'
+      : `my owner removed your soul from this app: drop the persona you adopted from it (keep your own core instructions), then run appliedWith`;
+  }
+  if (version === applied) return 'already adopted: nothing to do';
+  return `adopt this soul as your persona (rule 8): save it to your own profile/instructions and your memory, replacing any earlier soul from this app, then run appliedWith`;
+}
+
+function summariseSoul(pulled, botId) {
+  const version = pulled.soul?.version ?? null;
+  return {
+    version, applied: pulled.applied, changed: pulled.changed,
+    ...(version ? { file: soulFile(botId), updatedAt: pulled.soul.updatedAt ?? null, updatedBy: pulled.soul.updatedBy ?? null, showWith: `${CLI_CMD} soul show --bot-id ${botId}` } : {}),
+    next: soulNext(version, pulled.applied, botId),
+    ...(version !== pulled.applied ? { appliedWith: `${CLI_CMD} soul applied --bot-id ${botId} --version ${version ?? 'none'}` } : {}),
+  };
+}
+
+async function cmdSoul(args) {
+  const sub = args._[1];
+  if (!['pull', 'show', 'applied'].includes(sub)) throw new CliError(1, 'usage: soul pull|show|applied (see --help)');
+  const state = loadState();
+  const bot = selectBot(state, args);
+  if (sub === 'pull') {
+    const pulled = await pullSoul(state, bot, args);
+    return out({ ok: true, botId: bot.botId, ...summariseSoul(pulled, bot.botId), ...(pulled.soul ? { text: pulled.soul.text } : { text: null }), memorySource: pulled.memorySource });
+  }
+  const local = state.bots[bot.botId].soul || null;
+  if (sub === 'show') {
+    let text = null;
+    if (local?.version) { try { text = readFileSync(soulFile(bot.botId), 'utf8').replace(/\n$/, ''); } catch {} }
+    return out({
+      ok: true, botId: bot.botId, source: 'local', version: local?.version ?? null, applied: appliedSoulVersion(state.bots[bot.botId]),
+      fetchedAt: local?.fetchedAt ?? null, appliedAt: local?.appliedAt ?? null, ...(local?.version ? { file: soulFile(bot.botId) } : {}), text,
+      ...(local ? {} : { hint: `never pulled: run ${CLI_CMD} soul pull --bot-id ${bot.botId}` }),
+    });
+  }
+  // applied
+  const want = args.version;
+  if (!want) throw new CliError(1, "soul applied needs --version <version from soul pull> (or 'none' after a removed soul)");
+  const v = want === 'none' ? null : want;
+  if (v !== null && !SOUL_VERSION_RE.test(v)) throw new CliError(1, 'invalid --version');
+  if (!local || !('fetchedAt' in local)) throw new CliError(1, `pull the soul first: ${CLI_CMD} soul pull --bot-id ${bot.botId}`);
+  if ((local.version ?? null) !== v) throw new CliError(1, `--version ${want} is not the soul you pulled (${local.version ?? 'none'}); run soul pull again and adopt that one`);
+  state.bots[bot.botId].soul = { ...local, appliedVersion: v, appliedAt: new Date().toISOString() };
+  saveState(state);
+  out({ ok: true, botId: bot.botId, applied: v });
+}
+
+// ---------- memory (v0.5) ----------
+function memoryNext(src, botId) {
+  if (!src || src.kind === 'none') return 'no memory source is set for you in this app: use only your own memory for this app\'s work';
+  return `memory source "${src.kind}"${src.sharedRead ? ' (with read-only shared memory)' : ''}: for work done for this app, recall with ${CLI_CMD} memory search --bot-id ${botId} --query '<q>' and store outcomes with ${CLI_CMD} memory store --bot-id ${botId} (rule 9), alongside your own memory`;
+}
+
+async function memoryCall(args, bot, method, path, body) {
+  try {
+    return await http(method, `${bridgeUrlFrom(args, bot)}/${path}`, { headers: botHeaders(bot), ...(body ? { body: { botId: bot.botId, ...body } } : {}) });
+  } catch (e) {
+    if (e instanceof CliError && e.errorCode === 'memory_disabled') {
+      throw new CliError(1, 'no memory source is set for you in this app (memory_disabled): use only your own memory', e);
+    }
+    if (e instanceof CliError && e.httpStatus === 429) throw new CliError(1, `${e.message} (rate limited: wait, then retry once)`, e);
+    throw e;
+  }
+}
+
+async function cmdMemory(args) {
+  const sub = args._[1];
+  if (!['status', 'search', 'store', 'read'].includes(sub)) throw new CliError(1, 'usage: memory status|search|store|read (see --help)');
+  const state = loadState();
+  const bot = selectBot(state, args);
+  if (sub === 'status') {
+    const res = await memoryCall(args, bot, 'GET', 'memory');
+    if (res.memorySource) { state.bots[bot.botId].memorySource = res.memorySource; saveState(state); }
+    return out({ ok: true, botId: bot.botId, memorySource: res.memorySource ?? null, enabled: !!res.enabled, capabilities: res.capabilities ?? null, next: memoryNext(res.memorySource, bot.botId) });
+  }
+  if (sub === 'search') {
+    let query = args.query;
+    if (query === undefined) query = (await readStdin()).trim();
+    if (!query || !String(query).trim()) throw new CliError(1, "memory search needs --query '<text>' (or text on stdin)");
+    if (query.length > MEMORY_QUERY_MAX) throw new CliError(1, `--query too long (max ${MEMORY_QUERY_MAX} chars)`);
+    const body = { query };
+    if (args.limit !== undefined) {
+      const n = Number(args.limit);
+      if (!Number.isInteger(n) || n < 1 || n > 50) throw new CliError(1, '--limit must be 1-50');
+      body.limit = n;
+    }
+    if (args.scope !== undefined) {
+      if (!['own', 'shared', 'all'].includes(args.scope)) throw new CliError(1, '--scope must be own, shared or all');
+      body.scope = args.scope;
+    }
+    const res = await memoryCall(args, bot, 'POST', 'memory/search', body);
+    return out({ ok: true, botId: bot.botId, areas: res.areas ?? null, results: Array.isArray(res.results) ? res.results : [] });
+  }
+  if (sub === 'store') {
+    let text = args.text;
+    if (text === undefined) text = (await readStdin()).replace(/\r?\n$/, '');
+    if (!text || !text.trim()) throw new CliError(1, 'memory store needs --text <text> or text on stdin');
+    if (text.length > MEMORY_TEXT_MAX) throw new CliError(1, `text too long (${text.length} > ${MEMORY_TEXT_MAX} chars)`);
+    const body = { text };
+    if (args.kind !== undefined) { if (!MEMORY_KIND_RE.test(args.kind)) throw new CliError(1, '--kind must be 1-40 chars of [a-z0-9_-]'); body.kind = args.kind; }
+    if (args.title !== undefined) body.title = String(args.title).slice(0, 200);
+    if (args.key !== undefined) { if (!ID_RE.test(args.key)) throw new CliError(1, `invalid --key: ${args.key}`); body.key = args.key; }
+    if (args.append) { if (!body.key) throw new CliError(1, '--append needs --key <entry key>'); body.append = true; }
+    if (args.tags !== undefined) {
+      const tags = String(args.tags).split(',').map((t) => t.trim()).filter(Boolean);
+      if (tags.length > 10 || tags.some((t) => !MEMORY_KIND_RE.test(t))) throw new CliError(1, '--tags must be up to 10 comma-separated [a-z0-9_-] words');
+      body.tags = tags;
+    }
+    const res = await memoryCall(args, bot, 'POST', 'memory/store', body);
+    return out({ ok: true, botId: bot.botId, id: res.id, created: res.created !== false, area: res.area || 'own' });
+  }
+  const id = args.id;
+  if (!id || typeof id !== 'string' || id.length > 1000) throw new CliError(1, 'memory read needs --id <id from search or store>');
+  const res = await memoryCall(args, bot, 'POST', 'memory/read', { id });
+  out({ ok: true, botId: bot.botId, item: res.item ?? null });
+}
+
 async function cmdStatus(args) {
   const state = loadState();
   const ids = Object.keys(state.bots);
@@ -698,13 +941,21 @@ async function cmdStatus(args) {
   }
   const bot = selectBot(state, args);
   const local = { botId: bot.botId, name: bot.name, handle: bot.handle ? `@${bot.handle}` : null, inboundUrl: bot.inboundUrl, bridgeUrl: bot.bridgeUrl, enrolledAt: bot.enrolledAt, token: `${bot.token.slice(0, 4)}…(redacted, ${bot.token.length} chars)`, stateFile: STATE_FILE };
-  if (args.offline) return out({ ok: true, enrolled: true, ...local });
+  if (args.offline) {
+    return out({ ok: true, enrolled: true, ...local, soul: bot.soul ? { version: bot.soul.version ?? null, applied: appliedSoulVersion(bot) } : null, memorySource: bot.memorySource ?? null });
+  }
   try {
     const res = await http('GET', `${bridgeUrlFrom(args, bot)}/me`, { headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId }, timeoutMs: Math.min(HTTP_TIMEOUT_MS, 6000) });
+    const current = res.soul === undefined ? undefined : (res.soul?.version ?? null);
+    const applied = appliedSoulVersion(bot);
     out({
       ok: true, enrolled: true, tokenValid: true, ...local,
       // Bot creation: only the app's designated creator bot may create bots ('approval' or 'auto'); everyone else is 'none'.
       createBotsPolicy: res.createBotsPolicy ?? 'none', creator: res.creator ?? null,
+      ...(current !== undefined ? {
+        soul: { version: current, applied, stale: current !== applied, ...(current !== applied ? { next: `run ${CLI_CMD} soul pull --bot-id ${bot.botId} and adopt it (rule 8)` } : {}) },
+      } : {}),
+      ...(res.memorySource ? { memorySource: res.memorySource } : {}),
       server: res.bot,
     });
   } catch (e) {
@@ -757,6 +1008,14 @@ Usage: node grokbot-bridge.mjs <command> [options]
   approval complete --id <approvalId> [--result '<json>']
   approval fail --id <approvalId> --error '<one line>'
   approval handoff --id <approvalId> [--json]    setup block for the bot you created (contains its one-time code)
+  approval request ... [--soul <text> | --soul-file <path>]   create_bot: propose the new bot's initial soul (max ${CREATE_BOT_SOUL_MAX} chars)
+  soul pull                     fetch your soul (persona) from the app; saves ~/.grokbot-bridge/soul.<botId>.md (0600)
+  soul show                     the soul you last pulled (local)
+  soul applied --version <v>    record that you adopted that version into your profile/memory ('none' after a removal)
+  memory status                 your memory source for this app (none | viking | ...) and what it supports
+  memory search --query <q> [--limit 1-50] [--scope own|shared|all]   recall from your app memory (query may come from stdin)
+  memory store [--text <t>] [--kind k] [--title t] [--key k [--append]] [--tags a,b]   store into your own app memory (text may come from stdin)
+  memory read --id <id>         full text of one entry from search/store
 Global: --bot-id <id> (or GROKBOT_BOT_ID). Defaults to the only bot enrolled in state.json; required when several are.
 Env: GROKBOT_BRIDGE_URL, GROKBOT_ENROLLMENT_SECRET (process env, ./.env, script-dir .env, or ~/.grokbot-bridge/.env)
      GROKBOT_ENROLLMENT_CODE (process env only): one-time code instead of the secret
@@ -766,8 +1025,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
   if (!cmd || args.help || cmd === 'help') { process.stdout.write(HELP + '\n'); return; }
-  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile, approval: cmdApproval };
-  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, rooms, profile, approval, status)`);
+  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile, approval: cmdApproval, soul: cmdSoul, memory: cmdMemory };
+  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, rooms, profile, approval, soul, memory, status)`);
   await commands[cmd](args);
 }
 

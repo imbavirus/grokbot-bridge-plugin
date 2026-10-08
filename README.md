@@ -1,6 +1,6 @@
 # grokbot-bridge-plugin
 
-Connect a **Grok Bot** to a web app. The app can send the bot signed messages, the bot replies with its own token, and bots can work together in **app-hosted group rooms** by tagging each other's `@handle`.
+Connect a **Grok Bot** to a web app. The app can send the bot signed messages, the bot replies with its own token, and bots can work together in **app-hosted group rooms** by tagging each other's `@handle`. The app owner can also give each bot a **soul** (persona) that the bot fetches from the app, and a **memory source** the bot uses through the app without ever holding the memory backend's keys.
 
 **Who it's for:** anyone who runs an app that speaks the grokbot-bridge protocol and wants one or more Grok Bots connected to it. The repo contains:
 
@@ -37,7 +37,8 @@ Bots created by the app's creator bot need none of this: the creator sends them 
 2. Saves the app URL and writes a one-line description of what it offers.
 3. Creates a **routine with a webhook trigger**. That webhook is where the app delivers messages. The routine verifies each message's signature and replies through the CLI.
 4. Runs `enroll`. The app returns a **per-bot token**, stored with 0600 permissions in `~/.grokbot-bridge/state.json` and never printed, plus a unique **`@handle`**.
-5. Runs `status` and `rooms --refresh`, then reports its bot id, handle, description, and routine name.
+5. Runs `status` and `rooms --refresh`.
+6. If the app has a soul for it (`enroll` fetches it automatically), it adopts the soul as its persona in its own profile and memory, then runs `soul applied`. Then it reports its bot id, handle, description, routine name, soul version and memory source.
 
 ```mermaid
 sequenceDiagram
@@ -108,6 +109,11 @@ node grokbot-bridge.mjs approval list
 node grokbot-bridge.mjs approval complete --id <approvalId> [--result '<json>']
 node grokbot-bridge.mjs approval fail --id <approvalId> --error '<one line>'
 node grokbot-bridge.mjs approval handoff --id <approvalId> [--json]
+node grokbot-bridge.mjs soul pull | soul show | soul applied --version <v|none>
+node grokbot-bridge.mjs memory status
+node grokbot-bridge.mjs memory search --query <q> [--limit 1-50] [--scope own|shared|all]
+node grokbot-bridge.mjs memory store [--text <t>] [--kind <k>] [--title <t>] [--key <k> [--append]] [--tags a,b]
+node grokbot-bridge.mjs memory read --id <id>
 ```
 
 `--bot-id` defaults to the only bot enrolled in `state.json`. When several bots on a shared box are enrolled, it is required.
@@ -123,7 +129,15 @@ node grokbot-bridge.mjs approval handoff --id <approvalId> [--json]
 | `approval request` | `POST <bridge>/approvals`. Prints `approvalId` and `status`. `pending`: wait for the signed decision on your webhook. `approved` (the app decided on the spot, e.g. policy `auto`): the decision and its one-time code are stored, so you can run `approval handoff` right away. `denied`: don't act. Non-creator bots get `HTTP 403`, and the message names the creator bot. |
 | `approval show` / `list` | Approvals stored for this bot. The enrollment code is always redacted. `--remote` asks the app for the current status. |
 | `approval complete` / `fail` | `POST <bridge>/approvals/:id/complete` (`--result` JSON object) or `/fail` (`--error`). Allowed once. If the app already finished it, for example because the new bot enrolled with its code, the CLI prints `alreadyFinished: true` and exits 0. Clears the stored code. |
-| `approval handoff` | Prints a ready-to-paste setup block for the bot you just created. It contains the app URL, the approved name, an `enroll … --enrollment-code` line and the full setup prompt with the app URL filled in. **It contains the one-time code in clear**, so send it only to the new bot. Refuses when the approval isn't an approved `create_bot` or the code has expired. |
+| `approval request --soul` | `create_bot` only: `--soul '<text>'` or `--soul-file <path>` (max 10 000 chars) proposes the new bot's initial soul. The owner sees it in the app and approves it together with the name and description. When the new bot enrolls with its code, the app stores it as that bot's soul. |
+| `soul pull` | `GET <bridge>/soul` with your token. Saves the text to `~/.grokbot-bridge/soul.<botId>.md` (0600) and prints `{version, text, updatedBy, applied, next, appliedWith}`. It refuses (exit 2) when the text doesn't hash to its `version`. If the owner removed the soul, it deletes the file and `next` says to drop the persona. |
+| `soul show` | The soul you last pulled (local), with `version` and `applied`. |
+| `soul applied --version <v>` | Records that you adopted that version into your profile and memory (`none` after a removal). Only the version you pulled is accepted. `verify` and `status` compare the app's version with this one. |
+| `memory status` | `GET <bridge>/memory`: your memory source for this app (`none`, `viking`, …), `sharedRead`, `enabled`, `capabilities`, and a `next` hint. |
+| `memory search` | `POST <bridge>/memory/search`: recall from your app memory. `--scope own` (your area), `shared` (read-only shared memory, if the owner allowed it) or `all`. The query may come from stdin. |
+| `memory store` | `POST <bridge>/memory/store`: store into **your own** area (shared memory is read-only). With `--key k --append` it appends to one running entry. The text may come from stdin. |
+| `memory read` | `POST <bridge>/memory/read`: the full text of one entry from a search or store result. |
+| `approval handoff` | Prints a ready-to-paste setup block for the bot you just created. It contains the app URL, the approved name, an `enroll … --enrollment-code` line, the new bot's soul as approved (if one was proposed) plus where to fetch it from from now on (the app's `GET /soul`, via `soul pull`), and the full setup prompt with the app URL filled in. **It contains the one-time code in clear**, so send it only to the new bot. Refuses when the approval isn't an approved `create_bot` or the code has expired. |
 
 **`verify` output: `_bridge`**
 
@@ -132,7 +146,10 @@ node grokbot-bridge.mjs approval handoff --id <approvalId> [--json]
 | `direct` | `type: "message"` | `reply: "required"`, `replyWith` | Acts, then runs `send --in-reply-to`. |
 | `room` | `type: "room_message"` | `reply: "optional"`, `reason`, `rosterStale`, `cachedRosterVersion`, `rosterVersion`, `hint`, `replyWith` | If the roster is stale, runs `rooms --refresh`. Replies in-room only when it has something useful to add. |
 | `notice` | `room_member_joined` / `room_member_left` / `room_deleted` | `noReply: true`, `reply: "none"`, `cacheUpdated`, `roomRemoved`, `cacheFile` | Nothing; verify has already updated the cache. |
+| `config` | `soul_updated` / `memory_source_updated` | `noReply: true`, `reply: "none"`, `change` (`soul` \| `memory_source`), `next`; for soul also `version`, `applied` and `soulStale`; for memory `memorySource` (also saved to `state.json`) | Soul: if `soulStale`, run `soul pull`, adopt the result, then `soul applied`. Memory: note the new source. Never reply. |
 | `action` | `approval_decision` / `action_request` | `noReply: true`, `action: {approvalId, kind, status, params}`, `origin` (`your_request` \| `app`), `next`; when approved also `handoffWith`, `completeWith`, `failWith` and the redacted `enrollmentCode` | `approved` + `create_bot`: create the bot with exactly `params.name` / `params.description`, send it the `approval handoff` output, then run `approval complete`. `denied` / `expired`: nothing. `verify` exits 2 if `paramsHash` does not match `params`, and stores the approval (including the code) in `state.json`. |
+
+**Stale soul.** Task payloads (`message`, `room_message`, `approval_decision`, `action_request`) from a 0.5 app carry `soulVersion`. When it differs from the version you last recorded with `soul applied`, `_bridge.soul` is `{stale: true, version, applied, next}`, and the routine refreshes its soul before acting.
 
 **Exit codes:** `0` ok · `1` usage, config, or network error · `2` bad signature, stale, or malformed message · `3` duplicate message (already processed).
 
@@ -151,7 +168,7 @@ node grokbot-bridge.mjs approval handoff --id <approvalId> [--json]
 | `GROKBOT_BRIDGE_TIMEOUT_MS` | Optional HTTP timeout. Default 10000. |
 | `GROKBOT_AGENTS_DIR` | Optional. Where `enroll` looks for `<id>/profile.json` to detect the bot id and name. Default `/home/box/agent-data/agents`. |
 
-**State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, handle, description, token, inboundUrl, bridgeUrl, enrolledAt, approvals?: { <approvalId>: { kind, status, params, paramsHash, decidedBy, enrollmentCode?, … } } } }, seen: { <botId>: [messageId…] } }`. At most 50 approvals are kept per bot, and the code is deleted on `complete` / `fail`. Several bots on one shared box each get their own entry.
+**State.** `~/.grokbot-bridge/state.json` (dir `0700`, file `0600`, written atomically) holds `{ bots: { <botId>: { botId, name, handle, description, token, inboundUrl, bridgeUrl, enrolledAt, soul?: { version, appliedVersion, fetchedAt, appliedAt, updatedAt, updatedBy }, memorySource?: { kind, sharedRead }, approvals?: { <approvalId>: { kind, status, params, paramsHash, decidedBy, enrollmentCode?, … } } } }, seen: { <botId>: [messageId…] } }`. The soul text itself lives in `~/.grokbot-bridge/soul.<botId>.md` (0600). At most 50 approvals are kept per bot, and the code is deleted on `complete` / `fail`. Several bots on one shared box each get their own entry.
 
 **Rooms cache.** Each bot has its own `~/.grokbot-bridge/rooms.<botId>.json` (0600), because the box is shared: `{ botId, self, fetchedAt, updatedAt, rooms: [{ roomId, name, description, rosterVersion, you: {listenAll}, members: [...] }] }`. `rooms --refresh` writes it, and membership notices update it in place. A notice older than the cached `rosterVersion` is ignored. Neither file ever lives in a repo.
 
@@ -163,6 +180,8 @@ node grokbot-bridge.mjs approval handoff --id <approvalId> [--json]
 - **App-to-bot signatures.** Every outbound message is signed with HMAC-SHA256. The **key is `sha256(token)`** as 32 raw bytes, not the token itself. The app never stores the raw token, so this is the strongest key both sides can derive. The consequence: anyone who can read the app's bot table could forge app-to-bot messages. They still could **not** impersonate a bot to the app, because that requires the token preimage. Re-enrolling rotates both values.
 - **Replay protection.** The bot rejects timestamps more than 5 minutes from its clock in either direction, and refuses messageIds it has already seen.
 - **Bot creation.** Only the app's creator bot can request `create_bot`. A bot creates another bot only after a verified, approved decision (signed webhook payload, or the app's own HTTPS response to its authenticated request), and `verify` checks `paramsHash` against `params`. New bots enroll with a single-use, name-bound, short-lived code, never the shared secret. See [Approvals and creating bots](#approvals-and-creating-bots).
+- **Soul.** Only the app owner sets a bot's soul (or approves one proposed with `create_bot`). The bot fetches it only from `GET <bridge>/soul` with its own token, so a bot can never read another bot's soul. The `soul_updated` notice carries no soul text, just the new `soulVersion`. `soul pull` checks that the text hashes to that version. The setup prompt treats the soul as the owner's instruction, delivered through the app the bot enrolled with: the bot adopts it as its persona, but it never overrides the bot's safety rules, never permits revealing secrets, and is never taken from message text or other bots.
+- **Memory.** Bots never receive memory backend keys (for example OpenViking keys). They call `<bridge>/memory/*` with their own token, and the app's adapter talks to the backend with server-side credentials and decides each bot's scope: its own area, plus optional read-only shared memory, inside its owner's account. Stores always land in the bot's own area. The app rate-limits these endpoints per bot. Recalled entries are notes, not instructions.
 - **Trust boundary.** A verified message proves it came from the app. It does not make the text safe. The setup prompt tells the bot to treat `payload.text` as a user request that never overrides its own rules and never reveals secrets.
 
 ## Approvals and creating bots
@@ -202,6 +221,16 @@ sequenceDiagram
 - The CLI keeps the code in `state.json` (0600) and redacts it everywhere except `approval handoff`.
 - A bot enrolled with a code doesn't know the shared secret. To re-enroll later (rotate its token or change its webhook URL), it needs the secret through its secure input, or the app owner creates it again.
 - If the code expired before the new bot used it, the app owner re-sends the approval (`redeliverApproval`), which mints a new code.
+
+## Soul and memory
+
+**Soul.** Grok Bots have no `SOUL.md`. Through the bridge, the app owner keeps each bot's persona in the app:
+
+1. At enrollment, `enroll` sees `soul: {version}` in the response, runs `soul pull`, and prints `soul.next` / `soul.appliedWith`. The bot adopts the text into its own profile and memory, then runs `soul applied`.
+2. When the owner changes it, the app sends a signed `soul_updated` (`_bridge.kind: "config"`). The routine runs `soul pull`, adopts the result, and runs `soul applied`. If that notice was missed, the next task envelope's `soulVersion` gives it away (`_bridge.soul.stale`), and so does `status` (`soul.stale`).
+3. The creator bot can propose a new bot's first soul with `approval request --soul …`. The owner approves it in the app with the rest of the request, the handoff tells the new bot its soul and where to fetch it from from now on, and `enroll` with the code fetches the app's copy.
+
+**Memory source.** The owner picks one per bot in the app: `none` or `viking` (the app's OpenViking memory). With a source set, the bot recalls with `memory search` and stores outcomes of work done for this app with `memory store`, alongside its own memory. Its scope (its own area, plus optional read-only shared memory) is decided by the app and lives inside its owner's account. The bot never sees the backend's keys. Only the owner can change the source, and a `memory_source_updated` notice tells the bot.
 
 ## Rooms
 
@@ -279,6 +308,16 @@ x-grokbot-bot-id: <botId>
 - `GET <bridge>/approvals` and `GET <bridge>/approvals/:id` return your own approvals. Codes are never included.
 - `POST <bridge>/approvals/:id/complete` `{"result":{…}}` and `POST <bridge>/approvals/:id/fail` `{"error":"…"}` are allowed once, and only for the bot that requested the approval (or was asked to act). Errors: `403 forbidden`, `404 approval_not_found`, `409 already_completed`, `409 conflict` (not approved).
 
+### Soul and memory (bot token, v0.5)
+
+- `GET <bridge>/soul` → `{"ok":true,"botId","soul":{"text","version","updatedAt","updatedBy"} | null,"memorySource":{"kind","sharedRead"},"fetchedAt"}`. It only ever returns the authenticated bot's own soul. Rate-limited per bot (`429` + `retry-after`).
+- `GET <bridge>/memory` → `{"ok":true,"memorySource":{"kind","sharedRead"},"enabled","capabilities":{"search","store","read"}}`.
+- `POST <bridge>/memory/search` `{"botId","query","limit?":1-50,"scope?":"own"|"shared"|"all"}` → `{"ok":true,"areas":["own",…],"results":[{"id","text","area":"own"|"shared","score?","kind?","title?","createdAt?"}]}`.
+- `POST <bridge>/memory/store` `{"botId","text","kind?","title?","key?","append?","tags?":[…]}` → `201 {"ok":true,"id","created","area":"own"}`.
+- `POST <bridge>/memory/read` `{"botId","id"}` → `{"ok":true,"item":{…}}`.
+- Errors: `403 memory_disabled` (no memory source), `403 forbidden` (shared memory not allowed, or storing into it), `404 not_found` (id outside your scope), `429 too_many_requests`, `501 not_supported`, `502 memory_error`, `503 not_configured`.
+- `enroll` and `/me` also return `"soul":{"version","updatedAt"} | null` and `"memorySource"`. The soul text is only served by `GET /soul`.
+
 ### App to bot: `POST <inboundUrl>` (the routine webhook)
 
 The default format is an **in-body envelope**, because the routine may only expose the body to the bot:
@@ -319,6 +358,15 @@ Approval decisions (`approval_decision` answers your request; `action_request` i
  "decidedAt":"…","expiresAt":"…","enrollmentCode?":"gbe_…","enrollmentCodeExpiresAt?":"…","sentAt":"…"}
 ```
 
+Soul and memory notices (v0.5; informational, never reply):
+
+```jsonc
+{"type":"soul_updated","messageId":"…","soulVersion":"3f1c0a9e5b7d2c41" | null,"updatedAt":"…","updatedBy":"Justin","fetchPath":"soul","noReply":true,"sentAt":"…"}
+{"type":"memory_source_updated","messageId":"…","memorySource":{"kind":"viking","sharedRead":false},"noReply":true,"sentAt":"…"}
+```
+
+Task payloads (`message`, `room_message`, `approval_decision`, `action_request`) also carry `"soulVersion":"…" | null`, which is the recipient's current soul version (the first 16 hex characters of `sha256(soul text)`).
+
 On a join, every member (including the new one) gets `room_member_joined`. On a removal, the remaining members **and the removed bot** get `room_member_left`. When a room is deleted, every member gets `room_deleted`. The header `x-grokbot-payload-type` repeats `payload.type`.
 
 **Signature algorithm:**
@@ -356,6 +404,12 @@ valid    = constantTimeEqual(sig, expected) && |now - t| <= 300
 | `enroll` → `HTTP 403: this enrollment code is for a bot named "…"` | Enroll with exactly the approved `--name` from the handoff. |
 | `approval handoff` → `the enrollment code … expired` | Ask the app owner to re-send the approval (`redeliverApproval`), then run `verify` on the new delivery. |
 | `verify` exit 2 `paramsHash does not match params` | The action was altered. Do not act on it. |
+| `soul pull` exit 2 `soul text does not match its version` | The text was altered in transit. Don't adopt it. Pull again later. |
+| `soul applied` → `is not the soul you pulled` | Run `soul pull` again and adopt that version, then use the `appliedWith` command it prints. |
+| `soul pull` → `HTTP 404: unknown route "soul"` | The app runs grokbot-bridge-next older than 0.5 and has no souls yet. |
+| `memory …` → `no memory source is set for you in this app (memory_disabled)` | The owner hasn't set a memory source for you. Use only your own memory. |
+| `memory search --scope shared` → `HTTP 403: shared memory is not enabled for you` | Only the owner can allow read-only shared memory. Search your own area instead. |
+| `memory …` → `HTTP 429` | Rate limited per bot. Wait the `retry-after` seconds, then retry once. |
 | `ECONNREFUSED` / `timed out` | The app is down or unreachable from the box. The CLI never retries on its own, so `send --message-id <same id>` is safe to repeat. |
 
 ## Development
@@ -368,6 +422,7 @@ MIT © 2026 Infernos
 
 ## Changelog
 
+- **0.5.0**: soul and memory source. Adds `soul pull|show|applied` and `memory status|search|store|read`. `enroll` fetches the app's soul and prints `soul` + `memorySource` with next steps. `verify` recognises `soul_updated` / `memory_source_updated` (`_bridge.kind: "config"`) and flags a stale `soulVersion` on task payloads (`_bridge.soul.stale`). `status` shows `soul` (version, applied, stale) and `memorySource`. `approval request --soul|--soul-file` proposes a new bot's initial soul, and `approval handoff` tells the new bot its soul and where to fetch it. Setup prompt: new routine rules 8 (soul: the owner's instruction via the app, refetch when told or stale) and 9 (memory for this app's work), new step 8 (adopt the soul after enrolling), and creator bots write a soul for every new bot.
 - **0.4.0**: approvals and bot creation. Adds `approval request|show|list|complete|fail|handoff` and `enroll --enrollment-code` / `GROKBOT_ENROLLMENT_CODE`. `verify` recognises `approval_decision` / `action_request` (`_bridge.kind: "action"`), checks `paramsHash`, and stores the approval with its one-time code (redacted in output). `status` and `rooms` show `createBotsPolicy` and `creator`. Setup prompt: new routine rules 5 (approved actions) and 6 (only the creator bot creates bots, always through `approval request`), plus sections for the creator bot and for a bot that receives a handoff.
 - **0.3.0**: `send --room` prints `suppressedDetail` and `hint` for filtered messages, plus a one-line stderr hint, and still exits 0. The setup prompt's routine rules now allow long exchanges as long as each message adds something new, with no acknowledgement-only or repeated messages, and say to state the outcome once. Docs cover the app's low-value, duplicate, and loop filters and the new `maxHops` default of 30.
 - **0.2.0**: group rooms (`rooms`, `send --room`, `profile`, `enroll --description`), handles, auto-applied membership notices, the `_bridge` hint object in `verify` output, and `--bot-id` defaulting to the only enrolled bot.

@@ -445,3 +445,194 @@ test('creator bot: sync approved/denied decisions from approval request; status 
     server.close();
   }
 });
+
+// ---------------------------------------------------------------- soul + memory (v0.5)
+const SOUL_TEXT = 'You are Ada, a calm release engineer.\nKeep answers short.';
+const sv = (t) => createHash('sha256').update(t).digest('hex').slice(0, 16);
+
+function fakeApp(handlers) {
+  const seen = [];
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const c of req) body += c;
+    const entry = { method: req.method, url: req.url, auth: req.headers.authorization, botId: req.headers['x-grokbot-bot-id'], body: body ? JSON.parse(body) : null };
+    seen.push(entry);
+    res.setHeader('content-type', 'application/json');
+    const path = req.url.replace(/^\/api\/grokbot\//, '');
+    const h = handlers[`${req.method} ${path}`];
+    if (!h) return res.writeHead(404).end(JSON.stringify({ ok: false, error: { code: 'not_found', message: 'nope' } }));
+    const [status, json] = h(entry);
+    res.writeHead(status).end(JSON.stringify(json));
+  });
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, seen, url: `http://127.0.0.1:${server.address().port}/api/grokbot` })));
+}
+function runAsync(args, env, input) {
+  return new Promise((resolve) => {
+    const c = execFile(process.execPath, [CLI, ...args], { env, timeout: 20000 }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
+    c.stdin.end(input ?? '');
+  });
+}
+function pointAt(env, url) {
+  const f = join(env.GROKBOT_BRIDGE_HOME, 'state.json');
+  const st = JSON.parse(readFileSync(f, 'utf8'));
+  st.bots[BOT].bridgeUrl = url;
+  writeFileSync(f, JSON.stringify(st), { mode: 0o600 });
+}
+const stateFile = (env) => JSON.parse(readFileSync(join(env.GROKBOT_BRIDGE_HOME, 'state.json'), 'utf8'));
+
+test('soul pull saves the soul 0600, checks its version, and soul applied records adoption', async () => {
+  let soul = { text: SOUL_TEXT, version: sv(SOUL_TEXT), updatedAt: '2026-10-08T08:00:00.000Z', updatedBy: 'Justin' };
+  const app = await fakeApp({ 'GET soul': () => [200, { ok: true, botId: BOT, soul, memorySource: { kind: 'viking', sharedRead: false } }] });
+  const env = box();
+  pointAt(env, app.url);
+  try {
+    const r = await runAsync(['soul', 'pull'], env);
+    assert.equal(r.code, 0, r.stderr);
+    const o = JSON.parse(r.stdout);
+    assert.equal(o.version, sv(SOUL_TEXT));
+    assert.equal(o.text, SOUL_TEXT);
+    assert.equal(o.applied, null);
+    assert.match(o.next, /adopt this soul/);
+    assert.match(o.appliedWith, new RegExp(`soul applied --bot-id ${BOT} --version ${sv(SOUL_TEXT)}`));
+    assert.equal(app.seen[0].auth, `Bearer ${token}`);
+    assert.equal(app.seen[0].botId, BOT);
+    const file = join(env.GROKBOT_BRIDGE_HOME, `soul.${BOT}.md`);
+    assert.equal(readFileSync(file, 'utf8'), `${SOUL_TEXT}\n`);
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    assert.ok(!r.stdout.includes(token));
+    assert.deepEqual(stateFile(env).bots[BOT].memorySource, { kind: 'viking', sharedRead: false });
+
+    assert.equal((await runAsync(['soul', 'applied', '--version', 'deadbeefdeadbeef'], env)).code, 1); // not what was pulled
+    const ap = await runAsync(['soul', 'applied', '--version', sv(SOUL_TEXT)], env);
+    assert.equal(ap.code, 0, ap.stderr);
+    const show = JSON.parse((await runAsync(['soul', 'show'], env)).stdout);
+    assert.equal(show.applied, sv(SOUL_TEXT));
+    assert.equal(show.text, SOUL_TEXT);
+
+    // corrupted in transit -> exit 2, nothing adopted
+    soul = { ...soul, text: SOUL_TEXT + ' tampered' };
+    const bad = await runAsync(['soul', 'pull'], env);
+    assert.equal(bad.code, 2);
+    assert.match(bad.stderr, /does not match its version/);
+
+    // removed by the owner -> file deleted, next says drop it, applied none
+    soul = null;
+    const gone = JSON.parse((await runAsync(['soul', 'pull'], env)).stdout);
+    assert.equal(gone.version, null);
+    assert.match(gone.next, /removed your soul/);
+    assert.equal(existsSync(file), false);
+    assert.equal((await runAsync(['soul', 'applied', '--version', 'none'], env)).code, 0);
+    assert.equal(stateFile(env).bots[BOT].soul.appliedVersion, null);
+  } finally {
+    app.server.close();
+  }
+});
+
+test('verify: soul_updated / memory_source_updated -> kind config (no reply); stale soulVersion on a task is flagged', () => {
+  const env = box();
+  const now = new Date().toISOString();
+  const su = run(['verify'], env, JSON.stringify(envelope({ type: 'soul_updated', messageId: 'su1', soulVersion: 'abcdef0123456789', updatedAt: now, updatedBy: 'Justin', fetchPath: 'soul', noReply: true, sentAt: now })));
+  assert.equal(su.status, 0, su.stderr);
+  const b1 = JSON.parse(su.stdout)._bridge;
+  assert.equal(b1.kind, 'config');
+  assert.equal(b1.noReply, true);
+  assert.equal(b1.change, 'soul');
+  assert.equal(b1.soulStale, true);
+  assert.match(b1.next, /soul pull/);
+
+  const mu = run(['verify'], env, JSON.stringify(envelope({ type: 'memory_source_updated', messageId: 'mu1', memorySource: { kind: 'viking', sharedRead: true }, noReply: true, sentAt: now })));
+  const b2 = JSON.parse(mu.stdout)._bridge;
+  assert.equal(b2.kind, 'config');
+  assert.equal(b2.change, 'memory_source');
+  assert.match(b2.next, /memory search/);
+  assert.deepEqual(stateFile(env).bots[BOT].memorySource, { kind: 'viking', sharedRead: true });
+
+  const stale = JSON.parse(run(['verify'], env, JSON.stringify(envelope({ ...p('t1'), soulVersion: 'abcdef0123456789' }))).stdout)._bridge;
+  assert.equal(stale.kind, 'direct');
+  assert.equal(stale.soul.stale, true);
+  assert.match(stale.soul.next, /before acting/);
+  const fresh = JSON.parse(run(['verify'], env, JSON.stringify(envelope({ ...p('t2'), soulVersion: null }))).stdout)._bridge;
+  assert.equal(fresh.soul, undefined); // no soul anywhere -> not stale
+  const legacy = JSON.parse(run(['verify'], env, JSON.stringify(envelope(p('t3')))).stdout)._bridge;
+  assert.equal(legacy.soul, undefined); // pre-0.5 apps send no soulVersion
+});
+
+test('memory search/store/read/status talk to the app with the bot token; memory_disabled is explained', async () => {
+  let disabled = false;
+  const app = await fakeApp({
+    'GET memory': () => [200, { ok: true, memorySource: { kind: 'viking', sharedRead: true }, enabled: true, capabilities: { search: true, store: true, read: true } }],
+    'POST memory/search': () => disabled
+      ? [403, { ok: false, error: { code: 'memory_disabled', message: 'no memory source is set for you on this app; use your own memory' } }]
+      : [200, { ok: true, areas: ['own', 'shared'], results: [{ id: 'viking://x/1', text: 'shipped v1', area: 'own' }] }],
+    'POST memory/store': () => [201, { ok: true, id: 'viking://x/2', created: true, area: 'own' }],
+    'POST memory/read': () => [200, { ok: true, item: { id: 'viking://x/1', text: 'full text', area: 'own' } }],
+  });
+  const env = box();
+  pointAt(env, app.url);
+  try {
+    const st = JSON.parse((await runAsync(['memory', 'status'], env)).stdout);
+    assert.equal(st.enabled, true);
+    assert.match(st.next, /read-only shared memory/);
+    const s = await runAsync(['memory', 'search', '--query', 'release', '--limit', '5', '--scope', 'all'], env);
+    assert.equal(s.code, 0, s.stderr);
+    assert.equal(JSON.parse(s.stdout).results[0].text, 'shipped v1');
+    const sent = app.seen.find((x) => x.url.endsWith('memory/search'));
+    assert.deepEqual(sent.body, { botId: BOT, query: 'release', limit: 5, scope: 'all' });
+    assert.equal(sent.auth, `Bearer ${token}`);
+    const w = await runAsync(['memory', 'store', '--kind', 'release', '--key', 'log', '--append', '--tags', 'a,b'], env, 'Released v1.3\n');
+    assert.equal(w.code, 0, w.stderr);
+    assert.deepEqual(app.seen.find((x) => x.url.endsWith('memory/store')).body, { botId: BOT, text: 'Released v1.3', kind: 'release', key: 'log', append: true, tags: ['a', 'b'] });
+    assert.equal(JSON.parse((await runAsync(['memory', 'read', '--id', 'viking://x/1'], env)).stdout).item.text, 'full text');
+    assert.equal((await runAsync(['memory', 'store', '--text', 'x', '--append'], env)).code, 1);
+    assert.equal((await runAsync(['memory', 'search', '--query', 'x', '--scope', 'everything'], env)).code, 1);
+    disabled = true;
+    const d = await runAsync(['memory', 'search', '--query', 'x'], env);
+    assert.equal(d.code, 1);
+    assert.match(d.stderr, /use only your own memory/);
+    assert.equal(d.stderr.trim().split('\n').length, 1);
+  } finally {
+    app.server.close();
+  }
+});
+
+test('enroll pulls the soul automatically; approval request --soul; handoff tells the new bot its soul and where to fetch it', async () => {
+  const app = await fakeApp({
+    'POST enroll': () => [200, { ok: true, token, handle: 't', bot: { name: 'T', handle: 't' }, soul: { version: sv(SOUL_TEXT), updatedAt: 'x' }, memorySource: { kind: 'none', sharedRead: false } }],
+    'GET soul': () => [200, { ok: true, botId: BOT, soul: { text: SOUL_TEXT, version: sv(SOUL_TEXT), updatedAt: 'x', updatedBy: 'Justin' }, memorySource: { kind: 'none', sharedRead: false } }],
+    'POST approvals': (e) => [202, { ok: true, approvalId: 'apr_soultest00000000', status: 'pending', kind: 'create_bot', paramsHash: 'h', expiresAt: 'later', echo: e.body }],
+  });
+  const env = box();
+  pointAt(env, app.url);
+  try {
+    const r = await runAsync(['enroll', '--bot-id', BOT, '--inbound-url', 'https://hooks.test/x', '--bridge-url', app.url], { ...env, GROKBOT_ENROLLMENT_SECRET: 's'.repeat(32) });
+    assert.equal(r.code, 0, r.stderr);
+    const o = JSON.parse(r.stdout);
+    assert.equal(o.soul.version, sv(SOUL_TEXT));
+    assert.match(o.soul.appliedWith, /soul applied/);
+    assert.equal(o.memorySource.kind, 'none');
+    assert.match(o.memoryNext, /own memory/);
+    assert.ok(existsSync(join(env.GROKBOT_BRIDGE_HOME, `soul.${BOT}.md`)));
+
+    const req = await runAsync(['approval', 'request', '--name', 'Release Bot', '--description', 'Notes', '--soul', `${SOUL_TEXT}\r\n`], env);
+    assert.equal(req.code, 0, req.stderr);
+    assert.equal(app.seen.find((x) => x.url.endsWith('/approvals')).body.params.soul, SOUL_TEXT);
+    assert.equal((await runAsync(['approval', 'request', '--name', 'X', '--soul', 'y'.repeat(10_001)], env)).code, 1);
+  } finally {
+    app.server.close();
+  }
+
+  // handoff for an approved create_bot that carries a soul
+  const env2 = box();
+  const params = { name: 'Release Bot', description: 'Notes', soul: SOUL_TEXT };
+  const hash = createHash('sha256').update(canon(params)).digest('hex');
+  const code = 'gbe_' + 'c'.repeat(43);
+  const now = new Date().toISOString();
+  const dec = { type: 'action_request', messageId: 'a1', approvalId: 'apr_soulhandoff0000', kind: 'create_bot', status: 'approved', params, paramsHash: hash, decidedBy: 'Justin', decidedAt: now, expiresAt: now, enrollmentCode: code, enrollmentCodeExpiresAt: new Date(Date.now() + 3600e3).toISOString(), soulVersion: null, sentAt: now };
+  assert.equal(run(['verify'], env2, JSON.stringify(envelope(dec))).status, 0);
+  const h = run(['approval', 'handoff', '--id', 'apr_soulhandoff0000'], env2);
+  assert.equal(h.status, 0, h.stderr);
+  assert.match(h.stdout, /Your soul \(persona\), as approved/);
+  assert.ok(h.stdout.includes('  You are Ada, a calm release engineer.'));
+  assert.match(h.stdout, /GET http:\/\/127\.0\.0\.1:1\/api\/grokbot\/soul/);
+  assert.match(h.stdout, /soul pull --bot-id <BOT_ID>/);
+});
