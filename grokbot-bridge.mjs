@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
@@ -519,6 +519,8 @@ const CLI_CMD = 'node ~/.grokbot-bridge/plugin/grokbot-bridge.mjs';
 function classify(botId, p, bot) {
   if (CONFIG_TYPES.has(p.type)) return classifyConfig(botId, p, bot);
   const base = classifyTask(botId, p);
+  const ctx = requestContextOf(p);
+  if (ctx && (base.kind === 'direct' || base.kind === 'room')) base.context = ctx;
   // v0.5: task envelopes carry the bot's current soulVersion; compare with the version this bot last applied.
   if (p.soulVersion !== undefined && base.kind !== 'notice') {
     const applied = appliedSoulVersion(bot);
@@ -530,6 +532,40 @@ function classify(botId, p, bot) {
     }
   }
   return base;
+}
+
+// v0.7: the app's trusted request context (signed with the payload): `context` on a direct message,
+// `requestContext` on a room message (there `context` is the room history). Old apps send none.
+function requestContextOf(p) {
+  const c = p.type === 'room_message' ? p.requestContext : p.type === 'message' ? p.context : undefined;
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return null;
+  const pick = (o, keys) => {
+    if (!o || typeof o !== 'object') return undefined;
+    const r = {};
+    for (const k of keys) if (typeof o[k] === 'string' && o[k]) r[k] = o[k];
+    return Object.keys(r).length ? r : undefined;
+  };
+  const out = {
+    persona: pick(c.persona, ['id', 'name', 'kind']),
+    requester: pick(c.requester, ['agentId', 'agentName', 'kind']),
+    project: pick(c.project, ['id', 'name', 'goal']),
+    chat: pick(c.chat, ['id', 'name']),
+    missionId: typeof c.missionId === 'string' ? c.missionId : undefined,
+    taskId: typeof c.taskId === 'string' ? c.taskId : undefined,
+    runId: typeof c.runId === 'string' ? c.runId : undefined,
+    owner: typeof c.owner === 'string' ? c.owner : undefined,
+    replyTo: pick(c.replyTo, ['inReplyTo', 'conversationId', 'via']),
+  };
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  if (!Object.keys(out).length) return null;
+  const who = out.persona?.name || out.persona?.id;
+  out.memoryKey = `persona:${out.persona?.id || out.persona?.name || 'default'}`;
+  out.next = [
+    who ? `do this work for ${who}` : null,
+    out.project?.name ? `in project "${out.project.name}"` : null,
+    out.chat?.name ? `(chat "${out.chat.name}")` : null,
+  ].filter(Boolean).join(' ') + (who || out.project ? '; mention them in the reply if relevant and keep memory for this persona separate (memoryKey)' : '');
+  return out;
 }
 
 function classifyConfig(botId, p, bot) {

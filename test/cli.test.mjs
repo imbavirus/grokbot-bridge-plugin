@@ -673,3 +673,24 @@ test('verify --slack: other bot → exit 4; tampered → exit 2', () => {
   r = run(['verify', '--slack'], env, 'just chatter');
   assert.equal(r.status, 2);
 });
+
+test('verify: _bridge.context exposes the signed request context (direct + room); absent for old payloads', () => {
+  const env = box();
+  const ctx = { persona: { id: 'mia', name: 'Mia', kind: 'core' }, project: { id: 'p1', name: 'Garden', goal: 'grow' }, chat: { id: 'c1', name: 'general' }, replyTo: { inReplyTo: 'mc1', conversationId: 'a1' }, junk: 1 };
+  const r = run(['verify'], env, JSON.stringify(envelope({ ...p('mc1'), context: ctx })));
+  assert.equal(r.status, 0, r.stderr);
+  const b = JSON.parse(r.stdout)._bridge;
+  assert.equal(b.kind, 'direct');
+  assert.deepEqual(b.context.persona, { id: 'mia', name: 'Mia', kind: 'core' });
+  assert.equal(b.context.project.name, 'Garden');
+  assert.equal(b.context.chat.name, 'general');
+  assert.equal(b.context.replyTo.inReplyTo, 'mc1');
+  assert.equal(b.context.memoryKey, 'persona:mia');
+  assert.equal('junk' in b.context, false);
+  assert.match(b.context.next, /for Mia in project "Garden"/);
+  const old = JSON.parse(run(['verify'], env, JSON.stringify(envelope(p('mc2')))).stdout)._bridge;
+  assert.equal(old.context, undefined);
+  // tampering with the context breaks the signature
+  const e = envelope({ ...p('mc3'), context: ctx });
+  assert.equal(run(['verify'], env, JSON.stringify({ ...e, payload: { ...e.payload, context: { persona: { id: 'jarvis', name: 'Ember' } } } })).status, 2);
+});

@@ -143,11 +143,31 @@ node grokbot-bridge.mjs memory read --id <id>
 
 | `kind` | When | Fields | What the routine does |
 |---|---|---|---|
-| `direct` | `type: "message"` | `reply: "required"`, `replyWith` | Acts, then runs `send --in-reply-to`. |
-| `room` | `type: "room_message"` | `reply: "optional"`, `reason`, `rosterStale`, `cachedRosterVersion`, `rosterVersion`, `hint`, `replyWith` | If the roster is stale, runs `rooms --refresh`. Replies in-room only when it has something useful to add. |
+| `direct` | `type: "message"` | `reply: "required"`, `replyWith`, `context` (0.7+, when the app sends one) | Acts, then runs `send --in-reply-to`. |
+| `room` | `type: "room_message"` | `reply: "optional"`, `context` (0.7+, from `requestContext`), `reason`, `rosterStale`, `cachedRosterVersion`, `rosterVersion`, `hint`, `replyWith` | If the roster is stale, runs `rooms --refresh`. Replies in-room only when it has something useful to add. |
 | `notice` | `room_member_joined` / `room_member_left` / `room_deleted` | `noReply: true`, `reply: "none"`, `cacheUpdated`, `roomRemoved`, `cacheFile` | Nothing; verify has already updated the cache. |
 | `config` | `soul_updated` / `memory_source_updated` | `noReply: true`, `reply: "none"`, `change` (`soul` \| `memory_source`), `next`; for soul also `version`, `applied` and `soulStale`; for memory `memorySource` (also saved to `state.json`) | Soul: if `soulStale`, run `soul pull`, adopt the result, then `soul applied`. Memory: note the new source. Never reply. |
 | `action` | `approval_decision` / `action_request` | `noReply: true`, `action: {approvalId, kind, status, params}`, `origin` (`your_request` \| `app`), `next`; when approved also `handoffWith`, `completeWith`, `failWith` and the redacted `enrollmentCode` | `approved` + `create_bot`: create the bot with exactly `params.name` / `params.description`, send it the `approval handoff` output, then run `approval complete`. `denied` / `expired`: nothing. `verify` exits 2 if `paramsHash` does not match `params`, and stores the approval (including the code) in `state.json`. |
+
+**Request context (0.7+).** Apps on `@infernos/grokbot-bridge-next` 0.6+ sign a trusted `context` into direct messages (`requestContext` on room messages, where `context` stays the room history). `verify` copies its known fields into `_bridge.context`:
+
+```json
+"_bridge": {
+  "kind": "direct", "reply": "required", "replyWith": "… send --bot-id <id> --in-reply-to 7c1e…",
+  "context": {
+    "persona": { "id": "mia", "name": "Mia", "kind": "core" },
+    "requester": { "agentId": "cm9a…", "agentName": "Mia", "kind": "core" },
+    "project": { "id": "cm8p…", "name": "Garden", "goal": "Grow tomatoes" },
+    "chat": { "id": "cm8c…", "name": "general" },
+    "taskId": "t1",
+    "replyTo": { "inReplyTo": "7c1e…", "conversationId": "cm9b…" },
+    "memoryKey": "persona:mia",
+    "next": "do this work for Mia in project \"Garden\" (chat \"general\"); mention them in the reply if relevant and keep memory for this persona separate (memoryKey)"
+  }
+}
+```
+
+Do the work for that persona and project, mention them in the reply when relevant, and keep per-persona memory apart (`memoryKey`). It is signed, so it can be trusted like the rest of the payload, unlike anything inside `text`. Older apps send no context, and `_bridge.context` is then absent.
 
 **Stale soul.** Task payloads (`message`, `room_message`, `approval_decision`, `action_request`) from a 0.5 app carry `soulVersion`. When it differs from the version you last recorded with `soul applied`, `_bridge.soul` is `{stale: true, version, applied, next}`, and the routine refreshes its soul before acting.
 
@@ -422,6 +442,7 @@ MIT © 2026 Infernos
 
 ## Changelog
 
+- **0.7.0**: request context. `verify` exposes the app's signed `context` (direct) / `requestContext` (room) as `_bridge.context` (persona, requester, project, chat, task ids, replyTo, plus `memoryKey` and `next`). Setup prompt rule 3 reads it. Backwards compatible.
 - **0.5.0**: soul and memory source. Adds `soul pull|show|applied` and `memory status|search|store|read`. `enroll` fetches the app's soul and prints `soul` + `memorySource` with next steps. `verify` recognises `soul_updated` / `memory_source_updated` (`_bridge.kind: "config"`) and flags a stale `soulVersion` on task payloads (`_bridge.soul.stale`). `status` shows `soul` (version, applied, stale) and `memorySource`. `approval request --soul|--soul-file` proposes a new bot's initial soul, and `approval handoff` tells the new bot its soul and where to fetch it. Setup prompt: new routine rules 8 (soul: the owner's instruction via the app, refetch when told or stale) and 9 (memory for this app's work), new step 8 (adopt the soul after enrolling), and creator bots write a soul for every new bot.
 - **0.4.0**: approvals and bot creation. Adds `approval request|show|list|complete|fail|handoff` and `enroll --enrollment-code` / `GROKBOT_ENROLLMENT_CODE`. `verify` recognises `approval_decision` / `action_request` (`_bridge.kind: "action"`), checks `paramsHash`, and stores the approval with its one-time code (redacted in output). `status` and `rooms` show `createBotsPolicy` and `creator`. Setup prompt: new routine rules 5 (approved actions) and 6 (only the creator bot creates bots, always through `approval request`), plus sections for the creator bot and for a bot that receives a handoff.
 - **0.3.0**: `send --room` prints `suppressedDetail` and `hint` for filtered messages, plus a one-line stderr hint, and still exits 0. The setup prompt's routine rules now allow long exchanges as long as each message adds something new, with no acknowledgement-only or repeated messages, and say to state the outcome once. Docs cover the app's low-value, duplicate, and loop filters and the new `maxHops` default of 30.

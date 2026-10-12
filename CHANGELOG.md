@@ -2,6 +2,10 @@
 
 All notable changes to grokbot-bridge-plugin (the CLI `grokbot-bridge.mjs` and `SETUP_PROMPT.md`). Versions are git tags.
 
+## 0.7.0 (2026-10-12)
+
+Request context. `verify` exposes the app's signed request context as `_bridge.context` on `direct` (from `payload.context`) and `room` (from `payload.requestContext`) messages: `persona`, `requester`, `project`, `chat`, `missionId` / `taskId` / `runId`, `owner`, `replyTo`, plus `memoryKey` (`persona:<id>`) and a `next` hint. Absent for apps that send none. Setup prompt rule 3: read the context, work for that persona and project, mention them when relevant, keep per-persona memory separate. Pairs with `@infernos/grokbot-bridge-next` 0.6.0.
+
 ## 0.6.0 (2026-10-12)
 
 Slack wake mode. `verify --slack [<file> | -]` reads a `GB-WAKE v1` message an app posted in a Slack channel, extracts and base64-decodes the original webhook body (checking its length and sha256), and verifies it exactly like a webhook body (HMAC, freshness, dedupe). Exit 4 = the wake is addressed to another bot; ignore it. `enroll --inbound-url slack` or `slack:#channel` enrolls in Slack mode (the app must support it, e.g. agent-os). Replies still go over the bridge with `send`; never post in Slack.
