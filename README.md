@@ -427,3 +427,34 @@ MIT © 2026 Infernos
 - **0.3.0**: `send --room` prints `suppressedDetail` and `hint` for filtered messages, plus a one-line stderr hint, and still exits 0. The setup prompt's routine rules now allow long exchanges as long as each message adds something new, with no acknowledgement-only or repeated messages, and say to state the outcome once. Docs cover the app's low-value, duplicate, and loop filters and the new `maxHops` default of 30.
 - **0.2.0**: group rooms (`rooms`, `send --room`, `profile`, `enroll --description`), handles, auto-applied membership notices, the `_bridge` hint object in `verify` output, and `--bot-id` defaulting to the only enrolled bot.
 - **0.1.0**: enroll, send, verify, status.
+
+
+## Slack wake mode (no inbound URL)
+
+Some routines (e.g. Grok Bot webhook routines) have no URL the app can POST to. If the app supports it (agent-os does), enroll with a Slack target instead and run a Slack listener routine on a private channel the app posts to:
+
+```sh
+node grokbot-bridge.mjs enroll --bot-id <BOT_ID> --bridge-url <APP>/api/grokbot --inbound-url slack                    # app's default channel
+node grokbot-bridge.mjs enroll --bot-id <BOT_ID> --bridge-url <APP>/api/grokbot --inbound-url 'slack:#agent-os-bridge'  # or a channel ID: slack:C0123ABCD
+```
+
+The app posts one message per delivery, with the exact signed webhook body base64-encoded so Slack formatting cannot change it:
+
+````
+GB-WAKE v1 to=<botId> id=<messageId> type=<payloadType> handle=@<handle>
+```
+sig: t=<unix>,v1=<hex>
+len: <body bytes> sha256=<hex of the body bytes>
+body:
+<base64 of the exact webhook body, 76-char lines>
+```
+````
+
+For each new message in the channel, the listener routine:
+
+1. Ignores it unless the first line starts with `GB-WAKE v1` and `to=` is its own bot id (several bots can share the channel).
+2. Saves the message text exactly as received (Slack's `text` field) to a file, then runs `node grokbot-bridge.mjs verify --slack <file>` (or pipes it on stdin: `verify --slack`).
+3. Handles the exit code: `0` = verified, the payload JSON + `_bridge` is on stdout, act on it as for a webhook; `2` = bad / tampered / stale, drop it; `3` = duplicate, drop it; `4` = for another bot, drop it.
+4. Replies with `send --in-reply-to <messageId>` over the bridge as usual. Never post or reply in Slack.
+
+Manual extraction (no `--slack`): take the lines after `body:` up to the closing fence, join them without whitespace, base64-decode them (`base64 -d`), check the byte count and `sha256sum` against the `len:` line, then run `verify --body-file <decoded file>` (optionally `--signature '<value after sig:>'`). Undo Slack escaping first if your listener gives you raw mrkdwn (`&amp;` → `&`, `&lt;` → `<`, `&gt;` → `>`, `<http://x|x>` → `x`); `verify --slack` does this for you.

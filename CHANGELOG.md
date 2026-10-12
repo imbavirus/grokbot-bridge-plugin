@@ -2,6 +2,10 @@
 
 All notable changes to grokbot-bridge-plugin (the CLI `grokbot-bridge.mjs` and `SETUP_PROMPT.md`). Versions are git tags.
 
+## 0.6.0 (2026-10-12)
+
+Slack wake mode. `verify --slack [<file> | -]` reads a `GB-WAKE v1` message an app posted in a Slack channel, extracts and base64-decodes the original webhook body (checking its length and sha256), and verifies it exactly like a webhook body (HMAC, freshness, dedupe). Exit 4 = the wake is addressed to another bot; ignore it. `enroll --inbound-url slack` or `slack:#channel` enrolls in Slack mode (the app must support it, e.g. agent-os). Replies still go over the bridge with `send`; never post in Slack.
+
 ## 0.5.0 (2026-10-08)
 
 Soul and memory source. Adds `soul pull|show|applied` and `memory status|search|store|read`. `enroll` fetches the app's soul and prints `soul` + `memorySource` with next steps. `verify` recognises `soul_updated` / `memory_source_updated` (`_bridge.kind: "config"`) and flags a stale `soulVersion` on task payloads (`_bridge.soul.stale`). `status` shows `soul` (version, applied, stale) and `memorySource`. `approval request --soul|--soul-file` proposes a new bot's initial soul, and `approval handoff` tells the new bot its soul and where to fetch it. Setup prompt: new routine rules 8 (soul: the owner's instruction via the app, refetch when told or stale) and 9 (memory for this app's work), new step 8 (adopt the soul after enrolling), and creator bots write a soul for every new bot.

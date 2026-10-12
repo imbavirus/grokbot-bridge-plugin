@@ -5,6 +5,7 @@
 //   node grokbot-bridge.mjs enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>]
 //   node grokbot-bridge.mjs send    --text <text> [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>]
 //   node grokbot-bridge.mjs verify  [--body <json> | --body-file <path>]   (or stdin)
+//   node grokbot-bridge.mjs verify  --slack [<file> | -]   (a GB-WAKE v1 Slack message; stdin if no file)
 //   node grokbot-bridge.mjs rooms   [--refresh]
 //   node grokbot-bridge.mjs profile --description <text>
 //   node grokbot-bridge.mjs approval request|show|list|complete|fail|handoff ...
@@ -14,7 +15,8 @@
 //
 // --bot-id defaults to the only bot enrolled in state.json.
 // Exit codes: 0 ok, 1 usage/config/network error, 2 bad signature or stale
-// message, 3 duplicate message (already processed).
+// message, 3 duplicate message (already processed), 4 Slack wake addressed to
+// another bot (ignore it).
 
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -22,7 +24,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
@@ -65,7 +67,7 @@ function fail(code, message) {
 }
 
 // ---------- args / env ----------
-const BOOL_FLAGS = new Set(['no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote', 'append']);
+const BOOL_FLAGS = new Set(['slack', 'no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote', 'append']);
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -301,7 +303,10 @@ function bridgeUrlFrom(args, bot) {
 async function cmdEnroll(args) {
   const inboundUrl = args['inbound-url'];
   if (!inboundUrl) throw new CliError(1, 'enroll needs --inbound-url <your routine webhook URL>');
-  try { new URL(inboundUrl); } catch { throw new CliError(1, `--inbound-url is not a valid URL: ${inboundUrl}`); }
+  // Slack wake mode (app posts the signed body into a Slack channel): `slack` or `slack:#channel`.
+  if (!/^slack(:.*)?$/i.test(inboundUrl.trim())) {
+    try { new URL(inboundUrl); } catch { throw new CliError(1, `--inbound-url is not a valid URL (or slack / slack:#channel): ${inboundUrl}`); }
+  }
   // A one-time enrollment code (from an approved create_bot handoff) replaces the shared secret.
   const code = args['enrollment-code'] || process.env.GROKBOT_ENROLLMENT_CODE;
   if (code !== undefined && code !== '' && !CODE_RE.test(code)) throw new CliError(1, 'enrollment code must look like gbe_... (copy it exactly from the handoff)');
@@ -398,8 +403,22 @@ async function cmdVerify(args) {
   if (raw === undefined && args['body-file']) {
     try { raw = readFileSync(args['body-file'], 'utf8'); } catch (e) { throw new CliError(1, `cannot read --body-file: ${e.message}`); }
   }
+  if (raw === undefined && args.slack && args._[1] && args._[1] !== '-') {
+    try { raw = readFileSync(args._[1], 'utf8'); } catch (e) { throw new CliError(1, `cannot read ${args._[1]}: ${e.message}`); }
+  }
   if (raw === undefined) raw = await readStdin();
-  if (!raw || !raw.trim()) throw new CliError(1, 'verify needs the webhook body via --body, --body-file or stdin');
+  if (!raw || !raw.trim()) throw new CliError(1, args.slack ? 'verify --slack needs the Slack message text via <file>, --body-file or stdin' : 'verify needs the webhook body via --body, --body-file or stdin');
+  if (args.slack) {
+    let w;
+    try { w = parseSlackWake(raw); } catch (e) { throw new CliError(2, `not a valid GB-WAKE message: ${e.message}`); }
+    const state = loadState();
+    const want = args['bot-id'] || process.env.GROKBOT_BOT_ID;
+    const ids = Object.keys(state.bots);
+    const mine = want ? [want] : ids;
+    if (!mine.includes(w.to)) throw new CliError(4, `Slack wake is addressed to ${w.to}, not ${mine.join(', ') || 'this box'}; ignore it`);
+    args = { ...args, 'bot-id': w.to, ...(w.signature && !args.signature ? { signature: w.signature } : {}) };
+    raw = w.body;
+  }
 
   let env = findEnvelope(raw);
   if (!env) for (const o of extractJsonObjects(raw)) { env = findEnvelope(o); if (env) break; }
@@ -446,6 +465,49 @@ async function cmdVerify(args) {
   const shown = isAction && payload.enrollmentCode ? { ...payload, enrollmentCode: redactCode(payload.enrollmentCode) } : payload;
   const _bridge = classify(bot.botId, payload, state.bots[bot.botId]);
   process.stdout.write(JSON.stringify({ ...shown, _bridge }) + '\n');
+}
+
+// Slack wake (app → bot through a Slack channel). Text the app posts:
+//   GB-WAKE v1 to=<botId> id=<messageId> type=<payloadType>[ handle=@<handle>]
+//   ```
+//   sig: t=<unix>,v1=<hex>
+//   len: <bytes> sha256=<hex>
+//   body:
+//   <base64 of the exact webhook body, 76-char lines>
+//   ```
+// Tolerates Slack's entities (&amp; &lt; &gt;), <url|label> links, CRLF and dropped fences.
+const SLACK_WAKE_PREFIX = 'GB-WAKE v1';
+function parseSlackWake(text) {
+  const t = String(text)
+    .replace(/<([^<>|]*)\|([^<>]*)>/g, '$2').replace(/<([^<>]*)>/g, '$1')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\r\n?/g, '\n');
+  const lines = t.split('\n');
+  const hi = lines.findIndex((l) => l.includes(SLACK_WAKE_PREFIX));
+  if (hi < 0) throw new Error('no GB-WAKE v1 header');
+  const head = lines[hi].slice(lines[hi].indexOf(SLACK_WAKE_PREFIX) + SLACK_WAKE_PREFIX.length);
+  const field = (k) => new RegExp(`(?:^|\\s)${k}=(\\S+)`).exec(head)?.[1] ?? null;
+  const to = field('to'), id = field('id');
+  if (!to || !id) throw new Error('header lacks to= / id=');
+  let signature = '', len = null, sha = null, b64 = '', inBody = false;
+  for (const rawLine of lines.slice(hi + 1)) {
+    const l = rawLine.replace(/`/g, '').trim();
+    if (!l) continue;
+    if (l.startsWith(SLACK_WAKE_PREFIX)) break;
+    const m = /^(sig|len|body):\s*(.*)$/.exec(l);
+    if (m) {
+      inBody = m[1] === 'body';
+      if (m[1] === 'sig') signature = m[2].trim();
+      if (m[1] === 'len') { const lm = /^(\d+)\s+sha256=([0-9a-f]{64})$/.exec(m[2].trim()); if (lm) { len = Number(lm[1]); sha = lm[2]; } }
+      if (inBody && m[2]) b64 += m[2].replace(/\s+/g, '');
+      continue;
+    }
+    if (inBody) { if (!/^[A-Za-z0-9+/=]+$/.test(l)) break; b64 += l; }
+  }
+  if (!b64) throw new Error('no body');
+  const bytes = Buffer.from(b64, 'base64');
+  if (len !== null && bytes.length !== len) throw new Error(`body is ${bytes.length} bytes, header says ${len}`);
+  if (sha !== null && createHash('sha256').update(bytes).digest('hex') !== sha) throw new Error('body sha256 mismatch');
+  return { to, id, type: field('type') || '', handle: (field('handle') || '').replace(/^@/, '') || null, signature, body: bytes.toString('utf8') };
 }
 
 const NOTICE_TYPES = new Set(['room_member_joined', 'room_member_left', 'room_deleted']);
@@ -999,6 +1061,7 @@ Usage: node grokbot-bridge.mjs <command> [options]
   enroll  --inbound-url <url> [--description <text>] [--bot-id <id>] [--name <name>] [--bridge-url <url>] [--enrollment-code gbe_...]
   send    [--text <text>] [--room <roomId>] [--in-reply-to <id>] [--conversation-id <id>] [--type reply|message|event]   (text may come from stdin)
   verify  [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]   (body may come from stdin)
+  verify  --slack [<file> | -] [--bot-id <id>]   (a GB-WAKE v1 Slack message; exit 4 = addressed to another bot)
   rooms   [--refresh]          rooms you are in + rosters (cached in ~/.grokbot-bridge/rooms.<botId>.json)
   profile --description <text> update what you offer (max ${MAX_DESCRIPTION_CHARS} chars)
   status  [--offline]

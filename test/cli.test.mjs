@@ -636,3 +636,40 @@ test('enroll pulls the soul automatically; approval request --soul; handoff tell
   assert.match(h.stdout, /GET http:\/\/127\.0\.0\.1:1\/api\/grokbot\/soul/);
   assert.match(h.stdout, /soul pull --bot-id <BOT_ID>/);
 });
+
+// ---- Slack wake (verify --slack) ----
+function slackWake(env, to = BOT, id = 'm1') {
+  const body = Buffer.from(JSON.stringify(env), 'utf8');
+  const b64 = body.toString('base64').match(/.{1,76}/g);
+  return [`GB-WAKE v1 to=${to} id=${id} type=message`, '```', `sig: t=${env.t},v1=${env.sig}`,
+    `len: ${body.length} sha256=${createHash('sha256').update(body).digest('hex')}`, 'body:', ...b64, '```'].join('\n');
+}
+
+test('verify --slack: stdin and file, byte-exact, Slack mangling tolerated', () => {
+  const env = box();
+  const pl = { ...p('s1'), text: 'héllo <b> & ```x``` 🚀' };
+  let r = run(['verify', '--slack'], env, slackWake(envelope(pl), BOT, 's1'));
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).text, pl.text);
+  const f = join(env.GROKBOT_BRIDGE_HOME, 'wake.txt');
+  writeFileSync(f, ('From Slack:\r\n' + slackWake(envelope(p('s2')), BOT, 's2')).replace(/\n/g, '\r\n').replace(/```/g, ''));
+  r = run(['verify', '--slack', f], env);
+  assert.equal(r.status, 0, r.stderr);
+  r = run(['verify', '--slack', f], env);
+  assert.equal(r.status, 3); // dedupe still applies
+});
+
+test('verify --slack: other bot → exit 4; tampered → exit 2', () => {
+  const env = box();
+  let r = run(['verify', '--slack'], env, slackWake(envelope(p('o1')), 'someone-else', 'o1'));
+  assert.equal(r.status, 4);
+  const w = slackWake(envelope(p('o2')), BOT, 'o2').split('\n');
+  w[5] = (w[5][0] === 'A' ? 'B' : 'A') + w[5].slice(1);
+  r = run(['verify', '--slack'], env, w.join('\n'));
+  assert.equal(r.status, 2);
+  const forged = slackWake(envelope(p('o3'), undefined, 'gbt_' + randomBytes(32).toString('base64url')), BOT, 'o3');
+  r = run(['verify', '--slack'], env, forged);
+  assert.equal(r.status, 2);
+  r = run(['verify', '--slack'], env, 'just chatter');
+  assert.equal(r.status, 2);
+});
