@@ -24,7 +24,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.7.0';
+const VERSION = '0.8.0';
 const HTTP_TIMEOUT_MS = Number(process.env.GROKBOT_BRIDGE_TIMEOUT_MS) || 10_000;
 const HARD_DEADLINE_MS = HTTP_TIMEOUT_MS + 8_000;
 const DEFAULT_MAX_AGE_SEC = 300;
@@ -67,7 +67,7 @@ function fail(code, message) {
 }
 
 // ---------- args / env ----------
-const BOOL_FLAGS = new Set(['slack', 'no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote', 'append']);
+const BOOL_FLAGS = new Set(['slack', 'no-dedupe', 'offline', 'help', 'json', 'refresh', 'remote', 'append', 'yes']);
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
@@ -1090,6 +1090,29 @@ async function cmdProfile(args) {
   out({ ok: true, botId: bot.botId, handle: bot.handle ? `@${bot.handle}` : null, description: state.bots[bot.botId].description });
 }
 
+// v0.8: the bot is about to be deleted on the Grok Bot side. Revoke our own token in the app (it shows the bot
+// as removed at once), then forget the token and rooms cache locally. Needs --yes: there is no undo from here.
+async function cmdUnenroll(args) {
+  const state = loadState();
+  const bot = selectBot(state, args);
+  if (!args.yes) throw new CliError(1, `unenroll revokes @${bot.handle || bot.botId}'s token in the app for good; run it again with --yes (only right before the bot is deleted)`);
+  const reason = typeof args.reason === 'string' ? args.reason.slice(0, 300) : 'bot deleted on the Grok Bot side';
+  let res;
+  try {
+    res = await http('POST', `${bridgeUrlFrom(args, bot)}/unenroll`, { headers: { authorization: `Bearer ${bot.token}`, 'x-grokbot-bot-id': bot.botId }, body: { botId: bot.botId, reason } });
+  } catch (e) {
+    // 401 = the token is already revoked: the app already knows; still clean up locally.
+    if (!(e instanceof CliError) || !/HTTP 401/.test(e.message)) throw e;
+    res = { ok: true, alreadyRevoked: true };
+  }
+  delete state.bots[bot.botId];
+  if (state.seen) delete state.seen[bot.botId];
+  (state.removed ||= {})[bot.botId] = { at: new Date().toISOString(), handle: bot.handle ?? null, name: bot.name ?? null };
+  saveState(state);
+  rmSync(roomsFile(bot.botId), { force: true });
+  out({ ok: true, botId: bot.botId, unenrolled: true, ...(res.alreadyRevoked ? { alreadyRevoked: true } : { unenrolledAt: res.unenrolledAt ?? null }), next: 'the app now shows this bot as removed; delete the bot' });
+}
+
 function out(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
 
 const HELP = `grokbot-bridge ${VERSION}
@@ -1099,6 +1122,7 @@ Usage: node grokbot-bridge.mjs <command> [options]
   verify  [--body <json> | --body-file <path>] [--signature "t=..,v1=.."] [--max-age <sec>] [--no-dedupe]   (body may come from stdin)
   verify  --slack [<file> | -] [--bot-id <id>]   (a GB-WAKE v1 Slack message; exit 4 = addressed to another bot)
   rooms   [--refresh]          rooms you are in + rosters (cached in ~/.grokbot-bridge/rooms.<botId>.json)
+  unenroll --yes [--reason <text>]   before this bot is deleted: revoke its token in the app (shows it as removed) and forget it locally
   profile --description <text> update what you offer (max ${MAX_DESCRIPTION_CHARS} chars)
   status  [--offline]
   approval request [--kind create_bot] --name <name> --description <text> [--purpose <text>] [--reason <text>]   (other kinds: --params '<json>')
@@ -1124,8 +1148,8 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0];
   if (!cmd || args.help || cmd === 'help') { process.stdout.write(HELP + '\n'); return; }
-  const commands = { enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile, approval: cmdApproval, soul: cmdSoul, memory: cmdMemory };
-  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, send, verify, rooms, profile, approval, soul, memory, status)`);
+  const commands = { unenroll: cmdUnenroll, enroll: cmdEnroll, send: cmdSend, verify: cmdVerify, status: cmdStatus, rooms: cmdRooms, profile: cmdProfile, approval: cmdApproval, soul: cmdSoul, memory: cmdMemory };
+  if (!commands[cmd]) throw new CliError(1, `unknown command "${cmd}" (try: enroll, unenroll, send, verify, rooms, profile, approval, soul, memory, status)`);
   await commands[cmd](args);
 }
 

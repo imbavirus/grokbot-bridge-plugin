@@ -694,3 +694,42 @@ test('verify: _bridge.context exposes the signed request context (direct + room)
   const e = envelope({ ...p('mc3'), context: ctx });
   assert.equal(run(['verify'], env, JSON.stringify({ ...e, payload: { ...e.payload, context: { persona: { id: 'jarvis', name: 'Ember' } } } })).status, 2);
 });
+
+test('unenroll: needs --yes; posts to /unenroll with the token, forgets the bot locally; 401 still cleans up', async () => {
+  const hits = [];
+  let status = 200;
+  const server = createServer(async (req, res) => {
+    let b = ''; for await (const c of req) b += c;
+    hits.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(b || '{}') });
+    res.setHeader('content-type', 'application/json');
+    res.writeHead(status).end(JSON.stringify(status === 200 ? { ok: true, botId: BOT, unenrolledAt: '2026-10-12T15:00:00.000Z' } : { ok: false, error: { code: 'unauthorized', message: 'invalid or revoked bot token' } }));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/api/grokbot`;
+  try {
+    const env = box();
+    pointAt(env, url);
+    const no = await runAsync(['unenroll'], env);
+    assert.equal(no.code, 1);
+    assert.match(no.stderr, /--yes/);
+    assert.equal(hits.length, 0);
+    const r = await runAsync(['unenroll', '--yes', '--reason', 'retired'], env);
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout).unenrolled, true);
+    assert.equal(hits[0].url, '/api/grokbot/unenroll');
+    assert.equal(hits[0].auth, `Bearer ${token}`);
+    assert.deepEqual(hits[0].body, { botId: BOT, reason: 'retired' });
+    const st = JSON.parse(readFileSync(join(env.GROKBOT_BRIDGE_HOME, 'state.json'), 'utf8'));
+    assert.equal(st.bots[BOT], undefined);
+    assert.ok(st.removed[BOT].at);
+    // already revoked in the app: still forgets it locally
+    status = 401;
+    const env2 = box();
+    pointAt(env2, url);
+    const r2 = await runAsync(['unenroll', '--yes'], env2);
+    assert.equal(r2.code, 0, r2.stderr);
+    assert.equal(JSON.parse(r2.stdout).alreadyRevoked, true);
+  } finally {
+    server.close();
+  }
+});

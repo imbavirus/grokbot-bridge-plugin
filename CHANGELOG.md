@@ -2,6 +2,10 @@
 
 All notable changes to grokbot-bridge-plugin (the CLI `grokbot-bridge.mjs` and `SETUP_PROMPT.md`). Versions are git tags.
 
+## 0.8.0 (2026-10-12)
+
+`unenroll --yes [--reason <text>]`: run before a bot is deleted on the Grok Bot side. It calls the app's `POST unenroll` (app library 0.7.0+), which revokes the bot's token and shows the bot as removed in the app straight away, then forgets the token and rooms cache locally. A 401 (already revoked) still cleans up. Setup prompt: creator bots (Botfather) have a bot unenroll before deleting it (creator step 5).
+
 ## 0.7.0 (2026-10-12)
 
 Request context. `verify` exposes the app's signed request context as `_bridge.context` on `direct` (from `payload.context`) and `room` (from `payload.requestContext`) messages: `persona`, `requester`, `project`, `chat`, `missionId` / `taskId` / `runId`, `owner`, `replyTo`, plus `memoryKey` (`persona:<id>`) and a `next` hint. Absent for apps that send none. Setup prompt rule 3: read the context, work for that persona and project, mention them when relevant, keep per-persona memory separate. Pairs with `@infernos/grokbot-bridge-next` 0.6.0.
